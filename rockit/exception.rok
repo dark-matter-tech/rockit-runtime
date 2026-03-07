@@ -1,0 +1,59 @@
+// exception.rok — Exception handling (setjmp/longjmp)
+// Depends on: memory.rok
+
+extern fun longjmp(buf: Int, val2: Int): Unit
+
+val EXC_MAX_DEPTH: Int = 64
+val EXC_JMPBUF_SIZE: Int = 512   // generous per-buffer size (covers all platforms)
+
+var exc_bufs: Int = 0
+var exc_values: Int = 0
+var exc_depth: Int = 0
+
+fun exc_ensure_init(): Unit {
+    if (exc_bufs == 0) {
+        unsafe {
+            exc_bufs = malloc(EXC_MAX_DEPTH * EXC_JMPBUF_SIZE)
+            exc_values = malloc(EXC_MAX_DEPTH * 8)
+        }
+    }
+}
+
+fun exc_check_depth(): Unit {
+    if (exc_depth < EXC_MAX_DEPTH) { return }
+    unsafe { rockit_panic(cstr("try nesting too deep")) }
+}
+
+fun rockit_exc_push(): Int {
+    exc_ensure_init()
+    exc_check_depth()
+    val buf = exc_bufs + exc_depth * EXC_JMPBUF_SIZE
+    exc_depth = exc_depth + 1
+    return buf
+}
+
+fun rockit_exc_pop(): Unit {
+    if (exc_depth > 0) {
+        exc_depth = exc_depth - 1
+    }
+}
+
+fun rockit_exc_throw(value: Int): Unit {
+    if (exc_depth <= 0) {
+        unsafe {
+            write(2, cstr("PANIC: uncaught exception\n"), 25)
+            exit(1)
+        }
+    }
+    exc_depth = exc_depth - 1
+    unsafe {
+        bitcast<Ptr<Int>>(exc_values).offset(exc_depth).store(value)
+    }
+    longjmp(exc_bufs + exc_depth * EXC_JMPBUF_SIZE, 1)
+}
+
+fun rockit_exc_get(): Int {
+    unsafe {
+        return bitcast<Ptr<Int>>(exc_values).offset(exc_depth).load()
+    }
+}

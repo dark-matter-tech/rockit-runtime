@@ -1,0 +1,292 @@
+// list.rok — RockitList dynamic array
+// Depends on: memory.rok, object.rok (for rockit_retain_value/release_value)
+//
+// RockitList layout:
+//   offset 0: refCount  (i64)
+//   offset 8: size      (i64)
+//   offset 16: capacity (i64)
+//   offset 24: data     (ptr) — pointer to i64 array
+
+val LIST_REFCOUNT: Int = 0
+val LIST_SIZE: Int = 1
+val LIST_CAPACITY: Int = 2
+val LIST_DATA: Int = 3
+val LIST_HEADER: Int = 32
+
+fun rockit_list_create(): Int {
+    unsafe {
+        val list = malloc(LIST_HEADER)
+        val p = bitcast<Ptr<Int>>(list)
+        p.offset(LIST_REFCOUNT).store(1)
+        p.offset(LIST_SIZE).store(0)
+        p.offset(LIST_CAPACITY).store(8)
+        p.offset(LIST_DATA).store(malloc(64))  // 8 * sizeof(i64)
+        return list
+    }
+}
+
+fun listCreate(): Int {
+    return rockit_list_create()
+}
+
+fun rockit_list_append(list: Int, value: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        val cap = p.offset(LIST_CAPACITY).load()
+        if (size >= cap) {
+            val newCap = cap * 2
+            val oldData = p.offset(LIST_DATA).load()
+            val newData = realloc(oldData, newCap * 8)
+            p.offset(LIST_DATA).store(newData)
+            p.offset(LIST_CAPACITY).store(newCap)
+        }
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        dp.offset(size).store(value)
+        p.offset(LIST_SIZE).store(size + 1)
+    }
+}
+
+fun listAppend(list: Int, value: Int): Unit {
+    rockit_list_append(list, value)
+}
+
+fun rockit_list_get(list: Int, index: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { rockit_panic(cstr("list index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("list index out of bounds")) }
+        val arr = p.offset(LIST_DATA).load()
+        return bitcast<Ptr<Int>>(arr).offset(index).load()
+    }
+}
+
+fun listGet(list: Int, index: Int): Int {
+    return rockit_list_get(list, index)
+}
+
+fun rockit_list_set(list: Int, index: Int, value: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { rockit_panic(cstr("list index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("list index out of bounds")) }
+        val arr = p.offset(LIST_DATA).load()
+        bitcast<Ptr<Int>>(arr).offset(index).store(value)
+    }
+}
+
+fun listSet(list: Int, index: Int, value: Int): Unit {
+    rockit_list_set(list, index, value)
+}
+
+fun rockit_list_size(list: Int): Int {
+    if (list == 0) { return 0 }
+    unsafe {
+        return bitcast<Ptr<Int>>(list).offset(LIST_SIZE).load()
+    }
+}
+
+fun listSize(list: Int): Int {
+    return rockit_list_size(list)
+}
+
+fun listContains(list: Int, value: Int): Int {
+    if (list == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        var i: Int = 0
+        while (i < size) {
+            if (dp.offset(i).load() == value) { return 1 }
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+fun listRemoveAt(list: Int, index: Int): Int {
+    if (list == 0) { return ROCKIT_NULL }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { return ROCKIT_NULL }
+        if (index >= size) { return ROCKIT_NULL }
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        val removed = dp.offset(index).load()
+        var i: Int = index
+        while (i < size - 1) {
+            dp.offset(i).store(dp.offset(i + 1).load())
+            i = i + 1
+        }
+        p.offset(LIST_SIZE).store(size - 1)
+        return removed
+    }
+}
+
+fun rockit_list_contains(list: Int, value: Int): Int {
+    return listContains(list, value)
+}
+
+fun rockit_list_remove_at(list: Int, index: Int): Int {
+    return listRemoveAt(list, index)
+}
+
+fun rockit_list_create_filled(size: Int, value: Int): Int {
+    unsafe {
+        val list = malloc(LIST_HEADER)
+        val p = bitcast<Ptr<Int>>(list)
+        p.offset(LIST_REFCOUNT).store(1)
+        p.offset(LIST_SIZE).store(size)
+        var cap: Int = size
+        if (cap <= 0) { cap = 8 }
+        p.offset(LIST_CAPACITY).store(cap)
+        val arr = malloc(cap * 8)
+        if (value == 0) {
+            memset(arr, 0, size * 8)
+        } else {
+            val dp = bitcast<Ptr<Int>>(arr)
+            var i: Int = 0
+            while (i < size) {
+                dp.offset(i).store(value)
+                i = i + 1
+            }
+        }
+        p.offset(LIST_DATA).store(arr)
+        return list
+    }
+}
+
+fun listCreateFilled(size: Int, value: Int): Int {
+    return rockit_list_create_filled(size, value)
+}
+
+fun rockit_list_is_empty(list: Int): Int {
+    if (list == 0) { return 1 }
+    unsafe {
+        if (bitcast<Ptr<Int>>(list).offset(LIST_SIZE).load() == 0) { return 1 }
+    }
+    return 0
+}
+
+fun rockit_list_release(list: Int): Unit {
+    if (list == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val rc = p.offset(LIST_REFCOUNT).load()
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            val size = p.offset(LIST_SIZE).load()
+            val arr = p.offset(LIST_DATA).load()
+            val dp = bitcast<Ptr<Int>>(arr)
+            var i: Int = 0
+            while (i < size) {
+                rockit_release_value(dp.offset(i).load())
+                i = i + 1
+            }
+            free(arr)
+            free(list)
+        } else {
+            p.offset(LIST_REFCOUNT).store(newRc)
+        }
+    }
+}
+
+fun rockit_list_clear(list: Int): Unit {
+    if (list == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        var i: Int = 0
+        while (i < size) {
+            rockit_release_value(dp.offset(i).load())
+            i = i + 1
+        }
+        p.offset(LIST_SIZE).store(0)
+    }
+}
+
+fun listClear(list: Int): Unit {
+    rockit_list_clear(list)
+}
+
+fun listSetFloat(list: Int, index: Int, value: Float): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { return }
+        if (index >= size) { return }
+        val arr = p.offset(LIST_DATA).load()
+        bitcast<Ptr<Int>>(arr).offset(index).store(bitcast<Int>(value))
+    }
+}
+
+fun listGetFloat(list: Int, index: Int): Float {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { return bitcast<Float>(0) }
+        if (index >= size) { return bitcast<Float>(0) }
+        val arr = p.offset(LIST_DATA).load()
+        return bitcast<Float>(bitcast<Ptr<Int>>(arr).offset(index).load())
+    }
+}
+
+// ── ByteArray ────────────────────────────────────────────────────────────
+// Compact byte buffer: 1 byte per element (vs 8 for List).
+// Layout: refCount(i64) | size(i64) | data[](i8 inline)
+// Header = 16 bytes (2 x i64), data starts at offset 16.
+
+val BYTE_ARRAY_HEADER: Int = 16
+
+fun byteArrayCreate(size: Int): Int {
+    unsafe {
+        val arr = calloc(1, BYTE_ARRAY_HEADER + size)
+        val p = bitcast<Ptr<Int>>(arr)
+        p.offset(0).store(1)      // refCount = 1
+        p.offset(1).store(size)   // size
+        return arr
+    }
+}
+
+fun byteArrayCreateFilled(size: Int, value: Int): Int {
+    unsafe {
+        val arr = malloc(BYTE_ARRAY_HEADER + size)
+        val p = bitcast<Ptr<Int>>(arr)
+        p.offset(0).store(1)      // refCount = 1
+        p.offset(1).store(size)   // size
+        memset(arr + BYTE_ARRAY_HEADER, value, size)
+        return arr
+    }
+}
+
+fun byteArrayGet(arr: Int, index: Int): Int {
+    unsafe {
+        val size = bitcast<Ptr<Int>>(arr).offset(1).load()
+        if (index < 0) { rockit_panic(cstr("byteArray index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("byteArray index out of bounds")) }
+        return loadByte(arr + BYTE_ARRAY_HEADER, index)
+    }
+}
+
+fun byteArraySet(arr: Int, index: Int, value: Int): Unit {
+    unsafe {
+        val size = bitcast<Ptr<Int>>(arr).offset(1).load()
+        if (index < 0) { rockit_panic(cstr("byteArray index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("byteArray index out of bounds")) }
+        storeByte(arr + BYTE_ARRAY_HEADER, index, value)
+    }
+}
+
+fun byteArraySize(arr: Int): Int {
+    unsafe {
+        return bitcast<Ptr<Int>>(arr).offset(1).load()
+    }
+}

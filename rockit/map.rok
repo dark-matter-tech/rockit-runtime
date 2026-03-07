@@ -1,0 +1,377 @@
+// map.rok — String-keyed and integer-keyed hash maps
+// Depends on: memory.rok, string.rok, list.rok
+//
+// Map layout (shared by StringMap and IntMap):
+//   offset 0: refCount  (i64)
+//   offset 8: size      (i64)
+//   offset 16: capacity (i64)
+//   offset 24: entries   (ptr) — pointer to entry array
+//
+// Entry layout (3 i64 slots per entry):
+//   slot 0: key       (ptr or i64)
+//   slot 1: value     (i64)
+//   slot 2: occupied  (i64, 0 or 1)
+
+val MAP_REFCOUNT: Int = 0
+val MAP_SIZE: Int = 1
+val MAP_CAPACITY: Int = 2
+val MAP_ENTRIES: Int = 3
+val MAP_HEADER: Int = 32
+val ENTRY_SLOTS: Int = 3
+
+// ── Entry helpers ───────────────────────────────────────────────────────
+
+fun entry_key(entries: Int, idx: Int): Int {
+    unsafe { return bitcast<Ptr<Int>>(entries).offset(idx * ENTRY_SLOTS).load() }
+}
+
+fun entry_value(entries: Int, idx: Int): Int {
+    unsafe { return bitcast<Ptr<Int>>(entries).offset(idx * ENTRY_SLOTS + 1).load() }
+}
+
+fun entry_occupied(entries: Int, idx: Int): Int {
+    unsafe { return bitcast<Ptr<Int>>(entries).offset(idx * ENTRY_SLOTS + 2).load() }
+}
+
+fun entry_set(entries: Int, idx: Int, key: Int, value: Int): Unit {
+    unsafe {
+        val ep = bitcast<Ptr<Int>>(entries)
+        ep.offset(idx * ENTRY_SLOTS).store(key)
+        ep.offset(idx * ENTRY_SLOTS + 1).store(value)
+        ep.offset(idx * ENTRY_SLOTS + 2).store(1)
+    }
+}
+
+fun imod(a: Int, b: Int): Int {
+    return a - (a / b) * b
+}
+
+// ── String-keyed Map (used by Stage 1) ──────────────────────────────────
+
+fun mapCreate(): Int {
+    unsafe {
+        val map = malloc(MAP_HEADER)
+        val p = bitcast<Ptr<Int>>(map)
+        p.offset(MAP_REFCOUNT).store(1)
+        p.offset(MAP_SIZE).store(0)
+        p.offset(MAP_CAPACITY).store(16)
+        p.offset(MAP_ENTRIES).store(calloc(16 * ENTRY_SLOTS, 8))
+        return map
+    }
+}
+
+fun mapCreate_string(): Int {
+    return mapCreate()
+}
+
+fun smap_grow(map: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val oldCap = p.offset(MAP_CAPACITY).load()
+        val oldEntries = p.offset(MAP_ENTRIES).load()
+        val newCap = oldCap * 2
+        val newEntries = calloc(newCap * ENTRY_SLOTS, 8)
+        p.offset(MAP_CAPACITY).store(newCap)
+        p.offset(MAP_ENTRIES).store(newEntries)
+        p.offset(MAP_SIZE).store(0)
+        var i: Int = 0
+        while (i < oldCap) {
+            if (entry_occupied(oldEntries, i) != 0) {
+                val key = entry_key(oldEntries, i)
+                val value = entry_value(oldEntries, i)
+                var idx: Int = imod(string_hash(key), newCap)
+                while (entry_occupied(newEntries, idx) != 0) {
+                    idx = idx + 1
+                    if (idx >= newCap) { idx = 0 }
+                }
+                entry_set(newEntries, idx, key, value)
+                p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+            }
+            i = i + 1
+        }
+        free(oldEntries)
+    }
+}
+
+fun mapPut(mapVal: Int, key: Int, value: Int): Int {
+    if (mapVal == 0) { return 0 }
+    if (key == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(mapVal)
+        val entries = p.offset(MAP_ENTRIES).load()
+        if (entries == 0) { return 0 }
+        if (p.offset(MAP_SIZE).load() * 2 >= p.offset(MAP_CAPACITY).load()) {
+            smap_grow(mapVal)
+        }
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = imod(string_hash(key), cap)
+        while (entry_occupied(ent, idx) != 0) {
+            if (rockit_string_eq(entry_key(ent, idx), key) == 1) {
+                rockit_retain_value(value)
+                rockit_release_value(entry_value(ent, idx))
+                bitcast<Ptr<Int>>(ent).offset(idx * ENTRY_SLOTS + 1).store(value)
+                return 0
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+        }
+        rockit_string_retain(key)
+        rockit_retain_value(value)
+        entry_set(ent, idx, key, value)
+        p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+    }
+    return 0
+}
+
+fun mapGet(mapVal: Int, key: Int): Int {
+    if (mapVal == 0) { return ROCKIT_NULL }
+    if (key == 0) { return ROCKIT_NULL }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(mapVal)
+        val ent = p.offset(MAP_ENTRIES).load()
+        if (ent == 0) { return ROCKIT_NULL }
+        val cap = p.offset(MAP_CAPACITY).load()
+        var idx: Int = imod(string_hash(key), cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (rockit_string_eq(entry_key(ent, idx), key) == 1) {
+                return entry_value(ent, idx)
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+    return ROCKIT_NULL
+}
+
+fun mapKeys(mapVal: Int): Int {
+    val list = listCreate()
+    if (mapVal == 0) { return list }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(mapVal)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var i: Int = 0
+        while (i < cap) {
+            if (entry_occupied(ent, i) != 0) {
+                listAppend(list, entry_key(ent, i))
+            }
+            i = i + 1
+        }
+    }
+    return list
+}
+
+// ── Integer-keyed Map ──────────────────────────────────────────────────
+
+fun int_hash(key: Int, cap: Int): Int {
+    var h: Int = key
+    if (h < 0) { h = 0 - h }
+    h = h + h * 65599
+    if (h < 0) { h = 0 - h }
+    return imod(h, cap)
+}
+
+fun rockit_map_create(): Int {
+    unsafe {
+        val map = malloc(MAP_HEADER)
+        val p = bitcast<Ptr<Int>>(map)
+        p.offset(MAP_REFCOUNT).store(1)
+        p.offset(MAP_SIZE).store(0)
+        p.offset(MAP_CAPACITY).store(16)
+        p.offset(MAP_ENTRIES).store(calloc(16 * ENTRY_SLOTS, 8))
+        return map
+    }
+}
+
+fun imap_grow(map: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val oldCap = p.offset(MAP_CAPACITY).load()
+        val oldEntries = p.offset(MAP_ENTRIES).load()
+        val newCap = oldCap * 2
+        val newEntries = calloc(newCap * ENTRY_SLOTS, 8)
+        p.offset(MAP_CAPACITY).store(newCap)
+        p.offset(MAP_ENTRIES).store(newEntries)
+        p.offset(MAP_SIZE).store(0)
+        var i: Int = 0
+        while (i < oldCap) {
+            if (entry_occupied(oldEntries, i) != 0) {
+                val key = entry_key(oldEntries, i)
+                val value = entry_value(oldEntries, i)
+                var idx: Int = int_hash(key, newCap)
+                while (entry_occupied(newEntries, idx) != 0) {
+                    idx = idx + 1
+                    if (idx >= newCap) { idx = 0 }
+                }
+                entry_set(newEntries, idx, key, value)
+                p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+            }
+            i = i + 1
+        }
+        free(oldEntries)
+    }
+}
+
+fun rockit_map_put(map: Int, key: Int, value: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        if (p.offset(MAP_SIZE).load() * 2 >= p.offset(MAP_CAPACITY).load()) {
+            imap_grow(map)
+        }
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) {
+                rockit_retain_value(value)
+                rockit_release_value(entry_value(ent, idx))
+                bitcast<Ptr<Int>>(ent).offset(idx * ENTRY_SLOTS + 1).store(value)
+                return
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+        }
+        rockit_retain_value(key)
+        rockit_retain_value(value)
+        entry_set(ent, idx, key, value)
+        p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+    }
+}
+
+fun rockit_map_get(map: Int, key: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) {
+                return entry_value(ent, idx)
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+    unsafe { rockit_panic(cstr("map key not found")) }
+    return 0
+}
+
+fun rockit_map_contains_key(map: Int, key: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) { return 1 }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+    return 0
+}
+
+fun rockit_map_size(map: Int): Int {
+    if (map == 0) { return 0 }
+    unsafe { return bitcast<Ptr<Int>>(map).offset(MAP_SIZE).load() }
+}
+
+fun rockit_map_is_empty(map: Int): Int {
+    if (map == 0) { return 1 }
+    unsafe {
+        if (bitcast<Ptr<Int>>(map).offset(MAP_SIZE).load() == 0) { return 1 }
+    }
+    return 0
+}
+
+fun rockit_map_release(map: Int): Unit {
+    if (map == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val rc = p.offset(MAP_REFCOUNT).load()
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            val cap = p.offset(MAP_CAPACITY).load()
+            val ent = p.offset(MAP_ENTRIES).load()
+            var i: Int = 0
+            while (i < cap) {
+                if (entry_occupied(ent, i) != 0) {
+                    rockit_release_value(entry_key(ent, i))
+                    rockit_release_value(entry_value(ent, i))
+                }
+                i = i + 1
+            }
+            free(ent)
+            free(map)
+        } else {
+            p.offset(MAP_REFCOUNT).store(newRc)
+        }
+    }
+}
+
+fun rockit_map_keys(map: Int): Int {
+    val list = rockit_list_create()
+    if (map == 0) { return list }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var i: Int = 0
+        while (i < cap) {
+            if (entry_occupied(ent, i) != 0) {
+                rockit_list_append(list, entry_key(ent, i))
+            }
+            i = i + 1
+        }
+    }
+    return list
+}
+
+fun rockit_map_values(map: Int): Int {
+    val list = rockit_list_create()
+    if (map == 0) { return list }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var i: Int = 0
+        while (i < cap) {
+            if (entry_occupied(ent, i) != 0) {
+                rockit_list_append(list, entry_value(ent, i))
+            }
+            i = i + 1
+        }
+    }
+    return list
+}
+
+fun rockit_map_remove(map: Int, key: Int): Unit {
+    if (map == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        if (p.offset(MAP_SIZE).load() == 0) { return }
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) {
+                rockit_release_value(entry_key(ent, idx))
+                rockit_release_value(entry_value(ent, idx))
+                bitcast<Ptr<Int>>(ent).offset(idx * ENTRY_SLOTS + 2).store(0)
+                p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() - 1)
+                return
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+}

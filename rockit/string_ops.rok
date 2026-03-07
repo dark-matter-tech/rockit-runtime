@@ -1,0 +1,429 @@
+// string_ops.rok — String builtin operations
+// Depends on: memory.rok, string.rok
+
+extern fun strtoll(str: Int, endptr: Int, base: Int): Int
+
+// ── Character access ─────────────────────────────────────────────────────
+
+fun charAt(s: Int, index: Int): Int {
+    if (s == 0) { return rockit_string_new(0) }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        if (index < 0) { return rockit_string_new(0) }
+        if (index >= len) { return rockit_string_new(0) }
+        val chars = p.offset(2).load()
+        val ch = loadByte(chars, index)
+        // Build a 1-char string
+        val result = string_pool_alloc(1)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)          // refCount
+        rp.offset(1).store(1)          // length
+        rp.offset(3).store(0)          // base = NULL
+        rp.offset(4).store(POOL_MAX_LEN) // capacity
+        val dataPtr = result + STR_HEADER
+        storeByte(dataPtr, 0, ch)
+        storeByte(dataPtr, 1, 0)       // null terminator
+        rp.offset(2).store(dataPtr)    // chars
+        return result
+    }
+}
+
+fun charCodeAt(s: Int, index: Int): Int {
+    if (s == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        if (index < 0) { return 0 }
+        if (index >= len) { return 0 }
+        val chars = p.offset(2).load()
+        return loadByte(chars, index)
+    }
+}
+
+fun intToChar(code: Int): Int {
+    if (code < 0) { return rockit_string_new(0) }
+    if (code > 127) { return rockit_string_new(0) }
+    unsafe {
+        val result = string_pool_alloc(1)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)          // refCount
+        rp.offset(1).store(1)          // length
+        rp.offset(3).store(0)          // base = NULL
+        rp.offset(4).store(POOL_MAX_LEN) // capacity
+        val dataPtr = result + STR_HEADER
+        storeByte(dataPtr, 0, code)
+        storeByte(dataPtr, 1, 0)       // null terminator
+        rp.offset(2).store(dataPtr)    // chars
+        return result
+    }
+}
+
+// ── Prefix / suffix ──────────────────────────────────────────────────────
+
+fun startsWith(s: Int, prefix: Int): Int {
+    if (s == 0) { return 0 }
+    if (prefix == 0) { return 0 }
+    unsafe {
+        val ps = bitcast<Ptr<Int>>(s)
+        val pp = bitcast<Ptr<Int>>(prefix)
+        val sLen = ps.offset(1).load()
+        val pLen = pp.offset(1).load()
+        if (pLen > sLen) { return 0 }
+        val sChars = ps.offset(2).load()
+        val pChars = pp.offset(2).load()
+        if (memcmp(sChars, pChars, pLen) == 0) { return 1 }
+    }
+    return 0
+}
+
+fun endsWith(s: Int, suffix: Int): Int {
+    if (s == 0) { return 0 }
+    if (suffix == 0) { return 0 }
+    unsafe {
+        val ps = bitcast<Ptr<Int>>(s)
+        val px = bitcast<Ptr<Int>>(suffix)
+        val sLen = ps.offset(1).load()
+        val xLen = px.offset(1).load()
+        if (xLen > sLen) { return 0 }
+        val sChars = ps.offset(2).load()
+        val xChars = px.offset(2).load()
+        if (memcmp(sChars + sLen - xLen, xChars, xLen) == 0) { return 1 }
+    }
+    return 0
+}
+
+// ── Search ───────────────────────────────────────────────────────────────
+
+fun stringIndexOf(s: Int, needle: Int): Int {
+    if (s == 0) { return 0 - 1 }
+    if (needle == 0) { return 0 - 1 }
+    unsafe {
+        val ps = bitcast<Ptr<Int>>(s)
+        val pn = bitcast<Ptr<Int>>(needle)
+        val sLen = ps.offset(1).load()
+        val nLen = pn.offset(1).load()
+        if (nLen == 0) { return 0 }
+        if (nLen > sLen) { return 0 - 1 }
+        val sChars = ps.offset(2).load()
+        val nChars = pn.offset(2).load()
+        var i: Int = 0
+        while (i <= sLen - nLen) {
+            if (memcmp(sChars + i, nChars, nLen) == 0) {
+                return i
+            }
+            i = i + 1
+        }
+    }
+    return 0 - 1
+}
+
+// ── Trim ─────────────────────────────────────────────────────────────────
+
+fun stringTrim(s: Int): Int {
+    if (s == 0) { return rockit_string_new(0) }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        if (len == 0) { return rockit_string_new(0) }
+        val chars = p.offset(2).load()
+        var start: Int = 0
+        while (start < len) {
+            val ch = loadByte(chars, start)
+            if (ch != 32) {  // space
+                if (ch != 9) {  // tab
+                    if (ch != 10) {  // newline
+                        if (ch != 13) {  // carriage return
+                            // not whitespace
+                            break
+                        }
+                    }
+                }
+            }
+            start = start + 1
+        }
+        var end: Int = len - 1
+        while (end > start) {
+            val ch = loadByte(chars, end)
+            if (ch != 32) {
+                if (ch != 9) {
+                    if (ch != 10) {
+                        if (ch != 13) {
+                            break
+                        }
+                    }
+                }
+            }
+            end = end - 1
+        }
+        val trimLen = end - start + 1
+        val result = string_pool_alloc(trimLen)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)
+        rp.offset(1).store(trimLen)
+        rp.offset(3).store(0)
+        if (trimLen <= POOL_MAX_LEN) {
+            rp.offset(4).store(POOL_MAX_LEN)
+        } else {
+            rp.offset(4).store(trimLen)
+        }
+        val dataPtr = result + STR_HEADER
+        memcpy(dataPtr, chars + start, trimLen)
+        storeByte(dataPtr, trimLen, 0)
+        rp.offset(2).store(dataPtr)
+        return result
+    }
+}
+
+// ── Substring (zero-copy slice) ──────────────────────────────────────────
+
+fun substring(s: Int, start: Int, end: Int): Int {
+    if (s == 0) { return rockit_string_new(0) }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        var st: Int = start
+        var en: Int = end
+        if (st < 0) { st = 0 }
+        if (en > len) { en = len }
+        if (st >= en) { return rockit_string_new(0) }
+        val chars = p.offset(2).load()
+        val base = p.offset(3).load()
+        // Create a zero-copy slice
+        val result = slice_pool_alloc()
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)              // refCount = 1
+        rp.offset(1).store(en - st)        // length
+        rp.offset(2).store(chars + st)     // chars → into source data
+        // Chain to root: if source is a slice, reference its base
+        if (base != 0) {
+            rp.offset(3).store(base)
+            rockit_string_retain(base)
+        } else {
+            rp.offset(3).store(s)
+            rockit_string_retain(s)
+        }
+        return result
+    }
+}
+
+// ── Conversion ───────────────────────────────────────────────────────────
+
+fun toString(value: Int): Int {
+    if (value == ROCKIT_NULL) { return toString_null() }
+    if (value == 0) { return rockit_int_to_string(value) }
+    if (is_likely_string_ptr(value) == 1) { return value }
+    return rockit_int_to_string(value)
+}
+
+fun toString_null(): Int {
+    unsafe { return rockit_string_new(cstr("null")) }
+    return 0
+}
+
+fun rockit_int_to_string(value: Int): Int {
+    unsafe {
+        // Max i64 is 19 digits + sign + null = 21 chars
+        val buf = malloc(32)
+        // Manual int-to-string conversion
+        var v: Int = value
+        var negative: Int = 0
+        if (v < 0) {
+            negative = 1
+            v = 0 - v
+        }
+        var pos: Int = 30
+        storeByte(buf, 31, 0)  // null terminator
+        if (v == 0) {
+            storeByte(buf, pos, 48)  // '0'
+            pos = pos - 1
+        } else {
+            while (v > 0) {
+                val digit = v - (v / 10) * 10  // v % 10
+                storeByte(buf, pos, 48 + digit)  // '0' + digit
+                pos = pos - 1
+                v = v / 10
+            }
+        }
+        if (negative == 1) {
+            storeByte(buf, pos, 45)  // '-'
+            pos = pos - 1
+        }
+        val start = buf + pos + 1
+        val result = rockit_string_new(start)
+        free(buf)
+        return result
+    }
+}
+
+fun toInt(value: Int): Int {
+    if (value == ROCKIT_NULL) { return 0 }
+    if (value == 0) { return 0 }
+    if (is_likely_string_ptr(value) != 1) { return value }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(value)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        var bufLen: Int = len
+        if (bufLen > 31) { bufLen = 31 }
+        val buf = malloc(32)
+        memcpy(buf, chars, bufLen)
+        storeByte(buf, bufLen, 0)
+        val result = strtoll(buf, 0, 10)
+        free(buf)
+        return result
+    }
+    return value
+}
+
+// ── Character checks ─────────────────────────────────────────────────────
+
+fun isDigit(ch: Int): Int {
+    if (ch == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(ch)
+        val len = p.offset(1).load()
+        if (len == 0) { return 0 }
+        val chars = p.offset(2).load()
+        val c = loadByte(chars, 0)
+        if (c >= 48) {   // '0'
+            if (c <= 57) {  // '9'
+                return 1
+            }
+        }
+    }
+    return 0
+}
+
+fun isLetter(ch: Int): Int {
+    if (ch == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(ch)
+        val len = p.offset(1).load()
+        if (len == 0) { return 0 }
+        val chars = p.offset(2).load()
+        val c = loadByte(chars, 0)
+        if (c >= 97) {
+            if (c <= 122) { return 1 }  // a-z
+        }
+        if (c >= 65) {
+            if (c <= 90) { return 1 }   // A-Z
+        }
+        if (c == 95) { return 1 }       // _
+    }
+    return 0
+}
+
+fun isLetterOrDigit(ch: Int): Int {
+    if (isLetter(ch) == 1) { return 1 }
+    return isDigit(ch)
+}
+
+fun isIdentCodePoint(cp: Int): Int {
+    // a-z, A-Z, 0-9, _
+    if (cp >= 97) {
+        if (cp <= 122) { return 1 }
+    }
+    if (cp >= 65) {
+        if (cp <= 90) { return 1 }
+    }
+    if (cp >= 48) {
+        if (cp <= 57) { return 1 }
+    }
+    if (cp == 95) { return 1 }
+    return 0
+}
+
+// ── Type checks ──────────────────────────────────────────────────────────
+
+fun isMap(val2: Int): Int {
+    if (val2 != 0) {
+        if (val2 != ROCKIT_NULL) {
+            return 1
+        }
+    }
+    return 0
+}
+
+// ── Float-to-string ──────────────────────────────────────────────────────
+
+extern fun snprintf(buf: Int, size: Int, fmt: Int, val2: Int): Int
+
+fun floatToString(value: Float): Int {
+    unsafe {
+        val buf = malloc(64)
+        val fmt = cstr("%g")
+        snprintf(buf, 64, fmt, bitcast<Int>(value))
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+
+fun rockit_double_to_string(value: Float): Int {
+    return floatToString(value)
+}
+
+fun rockit_float_to_string(value: Float): Int {
+    unsafe {
+        val s = floatToString(value)
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        // Check if string needs ".0" suffix
+        var needsDot: Int = 1
+        var i: Int = 0
+        while (i < len) {
+            val ch = loadByte(chars, i)
+            if (ch == 46) {
+                needsDot = 0
+                break
+            }
+            if (ch == 101) {
+                needsDot = 0
+                break
+            }
+            if (ch == 69) {
+                needsDot = 0
+                break
+            }
+            i = i + 1
+        }
+        if (needsDot == 1) {
+            val dotZero = rockit_string_new(cstr(".0"))
+            val result = stringConcat(s, dotZero)
+            rockit_string_release(s)
+            rockit_string_release(dotZero)
+            return result
+        }
+        return s
+    }
+}
+
+fun rockit_bool_to_string(value: Int): Int {
+    unsafe {
+        if (value != 0) {
+            return rockit_string_new(cstr("true"))
+        }
+        return rockit_string_new(cstr("false"))
+    }
+}
+
+fun formatFloat(value: Float, decimals: Int): Int {
+    unsafe {
+        val buf = malloc(64)
+        // Build format string "%.<decimals>f"
+        val fmt = malloc(16)
+        storeByte(fmt, 0, 37)   // '%'
+        storeByte(fmt, 1, 46)   // '.'
+        // Convert decimals to chars (simple: assume 0-9)
+        storeByte(fmt, 2, 48 + decimals)  // '0' + decimals
+        storeByte(fmt, 3, 102)  // 'f'
+        storeByte(fmt, 4, 0)    // null terminator
+        snprintf(buf, 64, fmt, bitcast<Int>(value))
+        free(fmt)
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}

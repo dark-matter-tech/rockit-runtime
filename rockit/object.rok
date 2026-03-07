@@ -1,0 +1,170 @@
+// object.rok — RockitObject allocation, field access, type checking
+// Depends on: memory.rok
+//
+// RockitObject layout:
+//   offset 0:  typeName     (ptr)  — C string pointer
+//   offset 8:  refCount     (i64)
+//   offset 16: fieldCount   (i32) + ptrFieldBits (u32) — packed into i64
+//   offset 24+: fields[]    (i64 each)
+
+val OBJ_TYPENAME: Int = 0
+val OBJ_REFCOUNT: Int = 1
+val OBJ_FIELDINFO: Int = 2
+val OBJ_FIELDS: Int = 3
+
+fun rockit_object_alloc(typeName: Int, fieldCount: Int): Int {
+    unsafe {
+        val size = 24 + fieldCount * 8
+        val obj = malloc(size)
+        val p = bitcast<Ptr<Int>>(obj)
+        p.offset(OBJ_TYPENAME).store(typeName)
+        p.offset(OBJ_REFCOUNT).store(1)
+        // Pack fieldCount (lower 32 bits) and ptrFieldBits=0xFFFFFFFF (upper 32 bits)
+        // 0xFFFFFFFF << 32 = 0xFFFFFFFF00000000
+        val fieldInfo = 4294967295 * 4294967296 + fieldCount
+        p.offset(OBJ_FIELDINFO).store(fieldInfo)
+        // Zero-initialize fields
+        var i: Int = 0
+        while (i < fieldCount) {
+            p.offset(OBJ_FIELDS + i).store(0)
+            i = i + 1
+        }
+        return obj
+    }
+}
+
+fun rockit_object_get_field(obj: Int, index: Int): Int {
+    if (obj == 0) {
+        unsafe { rockit_panic(cstr("null pointer dereference in field access")) }
+    }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        return p.offset(OBJ_FIELDS + index).load()
+    }
+}
+
+fun rockit_object_set_field(obj: Int, index: Int, value: Int): Unit {
+    if (obj == 0) {
+        unsafe { rockit_panic(cstr("null pointer dereference in field set")) }
+    }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        p.offset(OBJ_FIELDS + index).store(value)
+    }
+}
+
+fun rockit_retain(obj: Int): Unit {
+    if (obj == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        val rc = p.offset(OBJ_REFCOUNT).load()
+        if (rc >= 0) {
+            p.offset(OBJ_REFCOUNT).store(rc + 1)
+        }
+    }
+}
+
+fun rockit_release(obj: Int): Unit {
+    if (obj == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        val rc = p.offset(OBJ_REFCOUNT).load()
+        if (rc < 0) { return }
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            // Get field count from lower 32 bits of fieldInfo
+            val fieldInfo = p.offset(OBJ_FIELDINFO).load()
+            val fieldCount = fieldInfo - (fieldInfo / 4294967296) * 4294967296
+            // Release all field values (conservative)
+            var i: Int = 0
+            while (i < fieldCount) {
+                rockit_release_value(p.offset(OBJ_FIELDS + i).load())
+                i = i + 1
+            }
+            free(obj)
+        } else {
+            p.offset(OBJ_REFCOUNT).store(newRc)
+        }
+    }
+}
+
+// ── Universal Value ARC ──────────────────────────────────────────────────
+
+fun rockit_retain_value(val2: Int): Unit {
+    if (is_likely_heap_ptr(val2) == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(val2)
+        val first = p.offset(0).load()
+        if (first == ROCKIT_IMMORTAL) { return }
+        if (is_likely_heap_ptr(first) == 1) {
+            // RockitObject: refCount at offset 1
+            val rc = p.offset(1).load()
+            p.offset(1).store(rc + 1)
+        } else {
+            // String/List/Map: refCount at offset 0
+            p.offset(0).store(first + 1)
+        }
+    }
+}
+
+fun rockit_release_value(val2: Int): Unit {
+    if (is_likely_heap_ptr(val2) == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(val2)
+        val first = p.offset(0).load()
+        if (first == ROCKIT_IMMORTAL) { return }
+        if (is_likely_heap_ptr(first) == 1) {
+            // RockitObject: refCount at offset 1
+            val rc = p.offset(1).load()
+            val newRc = rc - 1
+            if (newRc <= 0) {
+                val fieldInfo = p.offset(2).load()
+                val fieldCount = fieldInfo - (fieldInfo / 4294967296) * 4294967296
+                var i: Int = 0
+                while (i < fieldCount) {
+                    rockit_release_value(p.offset(3 + i).load())
+                    i = i + 1
+                }
+                free(val2)
+            } else {
+                p.offset(1).store(newRc)
+            }
+        } else {
+            // String/List/Map: refCount at offset 0
+            val newRc = first - 1
+            if (newRc <= 0) {
+                free(val2)
+            } else {
+                p.offset(0).store(newRc)
+            }
+        }
+    }
+}
+
+// ── Type checking ────────────────────────────────────────────────────────
+
+fun rockit_object_is_type(obj: Int, typeName: Int): Int {
+    if (obj == 0) { return 0 }
+    if (typeName == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        val objType = p.offset(OBJ_TYPENAME).load()
+        // Compare type name strings (C strings, use strcmp-like logic)
+        var i: Int = 0
+        while (true) {
+            val a = loadByte(objType, i)
+            val b = loadByte(typeName, i)
+            if (a != b) { return 0 }
+            if (a == 0) { return 1 }
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+fun rockit_object_get_type_name(obj: Int): Int {
+    if (obj == 0) { return 0 }
+    unsafe {
+        return bitcast<Ptr<Int>>(obj).offset(OBJ_TYPENAME).load()
+    }
+}

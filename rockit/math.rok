@@ -1,0 +1,32 @@
+// math.rok — Math function wrappers
+// Pure libc wrappers, no internal dependencies.
+
+extern fun sqrt(x: Float): Float
+extern fun sin(x: Float): Float
+extern fun cos(x: Float): Float
+extern fun tan(x: Float): Float
+extern fun pow(base: Float, exp: Float): Float
+extern fun floor(x: Float): Float
+extern fun ceil(x: Float): Float
+extern fun round(x: Float): Float
+extern fun log(x: Float): Float
+extern fun exp(x: Float): Float
+extern fun fabs(x: Float): Float
+extern fun atan2(y: Float, x: Float): Float
+
+fun rockit_math_sqrt(x: Float): Float { return sqrt(x) }
+fun rockit_math_sin(x: Float): Float { return sin(x) }
+fun rockit_math_cos(x: Float): Float { return cos(x) }
+fun rockit_math_tan(x: Float): Float { return tan(x) }
+fun rockit_math_pow(base: Float, e: Float): Float { return pow(base, e) }
+fun rockit_math_floor(x: Float): Float { return floor(x) }
+fun rockit_math_ceil(x: Float): Float { return ceil(x) }
+fun rockit_math_round(x: Float): Float { return round(x) }
+fun rockit_math_log(x: Float): Float { return log(x) }
+fun rockit_math_exp(x: Float): Float { return exp(x) }
+fun rockit_math_abs(x: Float): Float { return fabs(x) }
+fun rockit_math_atan2(y: Float, x: Float): Float { return atan2(y, x) }
+
+fun toFloat(value: Int): Float {
+    return bitcast<Float>(value)
+}

@@ -1,0 +1,185 @@
+// io.rok — I/O operations (print, println, readLine)
+// Depends on: memory.rok, string.rok, string_ops.rok
+
+extern fun putchar(ch: Int): Int
+extern fun getchar(): Int
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+fun write_string(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        write(1, chars, len)
+    }
+}
+
+fun write_newline(): Unit {
+    unsafe { write(1, cstr("\n"), 1) }
+}
+
+fun float_needs_decimal(chars: Int, len: Int): Int {
+    var i: Int = 0
+    while (i < len) {
+        val ch = loadByte(chars, i)
+        if (ch == 46) { return 0 }   // '.'
+        if (ch == 101) { return 0 }  // 'e'
+        if (ch == 69) { return 0 }   // 'E'
+        i = i + 1
+    }
+    return 1
+}
+
+// ── println variants ────────────────────────────────────────────────────
+
+fun rockit_println_int(value: Int): Unit {
+    val s = rockit_int_to_string(value)
+    write_string(s)
+    write_newline()
+    rockit_string_release(s)
+}
+
+fun rockit_println_float(value: Float): Unit {
+    val s = floatToString(value)
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        write(1, chars, len)
+        if (float_needs_decimal(chars, len) == 1) {
+            write(1, cstr(".0"), 2)
+        }
+    }
+    write_newline()
+    rockit_string_release(s)
+}
+
+fun rockit_println_bool(value: Int): Unit {
+    unsafe {
+        if (value != 0) {
+            write(1, cstr("true\n"), 5)
+        } else {
+            write(1, cstr("false\n"), 6)
+        }
+    }
+}
+
+fun rockit_println_string(s: Int): Unit {
+    if (s == 0) {
+        unsafe { write(1, cstr("null\n"), 5) }
+        return
+    }
+    write_string(s)
+    write_newline()
+}
+
+fun rockit_println_null(): Unit {
+    unsafe { write(1, cstr("null\n"), 5) }
+}
+
+fun rockit_println_any(value: Int): Unit {
+    if (value == ROCKIT_NULL) {
+        unsafe { write(1, cstr("null\n"), 5) }
+        return
+    }
+    if (value == 0) {
+        unsafe { write(1, cstr("0\n"), 2) }
+        return
+    }
+    if (is_likely_string_ptr(value) == 1) {
+        write_string(value)
+        write_newline()
+        return
+    }
+    rockit_println_int(value)
+}
+
+fun rockit_println_double(value: Float): Unit {
+    val s = floatToString(value)
+    write_string(s)
+    write_newline()
+    rockit_string_release(s)
+}
+
+// ── print variants (no newline) ─────────────────────────────────────────
+
+fun rockit_print_int(value: Int): Unit {
+    val s = rockit_int_to_string(value)
+    write_string(s)
+    rockit_string_release(s)
+}
+
+fun rockit_print_float(value: Float): Unit {
+    val s = floatToString(value)
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        write(1, chars, len)
+        if (float_needs_decimal(chars, len) == 1) {
+            write(1, cstr(".0"), 2)
+        }
+    }
+    rockit_string_release(s)
+}
+
+fun rockit_print_bool(value: Int): Unit {
+    unsafe {
+        if (value != 0) {
+            write(1, cstr("true"), 4)
+        } else {
+            write(1, cstr("false"), 5)
+        }
+    }
+}
+
+fun rockit_print_string(s: Int): Unit {
+    if (s == 0) {
+        unsafe { write(1, cstr("null"), 4) }
+        return
+    }
+    write_string(s)
+}
+
+fun rockit_print_any(value: Int): Unit {
+    if (value == ROCKIT_NULL) {
+        unsafe { write(1, cstr("null"), 4) }
+        return
+    }
+    if (value == 0) {
+        unsafe { write(1, cstr("0"), 1) }
+        return
+    }
+    if (is_likely_string_ptr(value) == 1) {
+        write_string(value)
+        return
+    }
+    rockit_print_int(value)
+}
+
+fun rockit_print_double(value: Float): Unit {
+    val s = floatToString(value)
+    write_string(s)
+    rockit_string_release(s)
+}
+
+// ── Input ───────────────────────────────────────────────────────────────
+
+fun readLine(): Int {
+    unsafe {
+        val buf = malloc(4096)
+        var pos: Int = 0
+        while (pos < 4095) {
+            val ch = getchar()
+            if (ch < 0) { break }
+            if (ch == 10) { break }
+            storeByte(buf, pos, ch)
+            pos = pos + 1
+        }
+        storeByte(buf, pos, 0)
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}

@@ -1,0 +1,100 @@
+// file.rok — File I/O operations
+// Depends on: memory.rok, string.rok
+
+extern fun fopen(path: Int, mode: Int): Int
+extern fun fclose(file: Int): Int
+extern fun fread(buf: Int, size: Int, count: Int, file: Int): Int
+extern fun fwrite(buf: Int, size: Int, count: Int, file: Int): Int
+extern fun fseek(file: Int, offset: Int, whence: Int): Int
+extern fun ftell(file: Int): Int
+extern fun remove(path: Int): Int
+
+fun fileExists(path: Int): Int {
+    if (path == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("r"))
+        cstr_done(c, path)
+        if (f != 0) {
+            fclose(f)
+            return 1
+        }
+    }
+    return 0
+}
+
+fun fileRead(path: Int): Int {
+    if (path == 0) {
+        unsafe { return rockit_string_new(cstr("")) }
+    }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("rb"))
+        cstr_done(c, path)
+        if (f == 0) { return rockit_string_new(cstr("")) }
+        fseek(f, 0, 2)    // SEEK_END = 2
+        val size = ftell(f)
+        fseek(f, 0, 0)    // SEEK_SET = 0
+        val buf = malloc(size + 1)
+        val bytesRead = fread(buf, 1, size, f)
+        storeByte(buf, bytesRead, 0)
+        fclose(f)
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+
+fun fileWrite(path: Int, content: Int): Int {
+    if (path == 0) { return 0 }
+    if (content == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("wb"))
+        cstr_done(c, path)
+        if (f == 0) { return 0 }
+        val p = bitcast<Ptr<Int>>(content)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        fwrite(chars, 1, len, f)
+        fclose(f)
+        return len
+    }
+}
+
+fun fileWriteBytes(path: Int, bytesListVal: Int): Int {
+    if (path == 0) { return 0 }
+    if (bytesListVal == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("wb"))
+        cstr_done(c, path)
+        if (f == 0) { return 0 }
+        val lp = bitcast<Ptr<Int>>(bytesListVal)
+        val size = lp.offset(LIST_SIZE).load()
+        val arr = lp.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        val buf = malloc(1)
+        var i: Int = 0
+        while (i < size) {
+            val b = dp.offset(i).load()
+            storeByte(buf, 0, b)
+            fwrite(buf, 1, 1, f)
+            i = i + 1
+        }
+        free(buf)
+        fclose(f)
+        return size
+    }
+}
+
+fun fileDelete(path: Int): Int {
+    if (path == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val result = remove(c)
+        cstr_done(c, path)
+        if (result == 0) { return 1 }
+    }
+    return 0
+}

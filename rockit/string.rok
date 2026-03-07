@@ -1,0 +1,366 @@
+// string.rok — RockitString core operations
+// Depends on: memory.rok
+//
+// RockitString layout (matches C struct):
+//   offset 0:  refCount (i64)
+//   offset 8:  length   (i64)
+//   offset 16: chars    (ptr) — points to character data
+//   offset 24: base     (ptr) — non-null for slices (retained reference to owner)
+//   offset 32: capacity (i64) — allocated data capacity in bytes (owned strings only)
+//   offset 40+: data[]  — inline character data (owned strings only)
+//
+// Header size: 40 bytes (5 x i64)
+
+val STR_HEADER: Int = 40
+
+// ── String pool ──────────────────────────────────────────────────────────
+// Free list for small owned strings to avoid malloc/free overhead.
+
+val POOL_MAX_LEN: Int = 48
+val POOL_BLOCK_SIZE: Int = 89  // STR_HEADER(40) + POOL_MAX_LEN(48) + 1
+
+var string_pool_free: Int = 0
+var slice_pool_free: Int = 0
+
+fun string_pool_alloc(len: Int): Int {
+    unsafe {
+        if (len <= POOL_MAX_LEN) {
+            if (string_pool_free != 0) {
+                val s = string_pool_free
+                // Follow free list: next pointer stored at offset 0
+                string_pool_free = bitcast<Ptr<Int>>(s).offset(0).load()
+                return s
+            }
+            return malloc(POOL_BLOCK_SIZE)
+        }
+        return malloc(STR_HEADER + len + 1)
+    }
+}
+
+fun string_pool_dealloc(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val length = p.offset(1).load()
+        if (length <= POOL_MAX_LEN) {
+            // Push onto free list
+            p.offset(0).store(string_pool_free)
+            string_pool_free = s
+        } else {
+            free(s)
+        }
+    }
+}
+
+fun slice_pool_alloc(): Int {
+    unsafe {
+        if (slice_pool_free != 0) {
+            val s = slice_pool_free
+            slice_pool_free = bitcast<Ptr<Int>>(s).offset(0).load()
+            return s
+        }
+        return malloc(STR_HEADER)
+    }
+}
+
+fun slice_pool_dealloc(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        p.offset(0).store(slice_pool_free)
+        slice_pool_free = s
+    }
+}
+
+// ── Core string functions ────────────────────────────────────────────────
+
+fun rockit_string_new(utf8: Int): Int {
+    unsafe {
+        var src: Int = utf8
+        if (src == 0) {
+            src = cstr("")
+        }
+        val len = strlen(src)
+        val s = string_pool_alloc(len)
+        val p = bitcast<Ptr<Int>>(s)
+        p.offset(0).store(1)           // refCount = 1
+        p.offset(1).store(len)         // length
+        p.offset(3).store(0)           // base = NULL
+        if (len <= POOL_MAX_LEN) {
+            p.offset(4).store(POOL_MAX_LEN)  // capacity = pool block size
+        } else {
+            p.offset(4).store(len)           // capacity = exact allocation
+        }
+        val dataPtr = s + STR_HEADER
+        memcpy(dataPtr, src, len + 1)  // copy including null terminator
+        p.offset(2).store(dataPtr)     // chars → data region
+        return s
+    }
+}
+
+fun rockit_string_concat(a: Int, b: Int): Int {
+    // stringConcat wrapper — called as rockit_string_concat
+    return stringConcat(a, b)
+}
+
+// ── Consume-concat: takes ownership of LHS for in-place append ──────────
+// Used by codegen for `s = s + expr` patterns. The caller does NOT retain
+// the LHS — this function either mutates it in-place (if unique & has capacity)
+// or allocates a new string and releases the old one.
+
+fun rockit_string_concat_consume(a: Int, b: Int): Int {
+    unsafe {
+        val pa = bitcast<Ptr<Int>>(a)
+        val rc = pa.offset(0).load()
+        val base = pa.offset(3).load()
+        val lenA = pa.offset(1).load()
+        val pb = bitcast<Ptr<Int>>(b)
+        val lenB = pb.offset(1).load()
+        val newLen = lenA + lenB
+
+        // Fast path: unique owner, not a slice, not immortal
+        if (rc == 1) {
+            if (base == 0) {
+                if (rc != ROCKIT_IMMORTAL) {
+                    val cap = pa.offset(4).load()
+                    if (newLen <= cap) {
+                        // Append in-place — no allocation
+                        val charsA = pa.offset(2).load()
+                        val charsB = pb.offset(2).load()
+                        memcpy(charsA + lenA, charsB, lenB)
+                        storeByte(charsA, newLen, 0)
+                        pa.offset(1).store(newLen)
+                        return a
+                    }
+                    // Grow: realloc with 2x capacity
+                    var newCap: Int = cap * 2
+                    if (newCap < newLen) { newCap = newLen }
+                    val newBlock = realloc(a, STR_HEADER + newCap + 1)
+                    val np = bitcast<Ptr<Int>>(newBlock)
+                    val newDataPtr = newBlock + STR_HEADER
+                    val charsB2 = pb.offset(2).load()
+                    memcpy(newDataPtr + lenA, charsB2, lenB)
+                    storeByte(newDataPtr, newLen, 0)
+                    np.offset(1).store(newLen)
+                    np.offset(2).store(newDataPtr)
+                    np.offset(4).store(newCap)
+                    return newBlock
+                }
+            }
+        }
+
+        // Slow path: not unique or slice — allocate new, release old
+        val result = stringConcat(a, b)
+        rockit_string_release(a)
+        return result
+    }
+}
+
+fun stringConcat(a: Int, b: Int): Int {
+    unsafe {
+        val pa = bitcast<Ptr<Int>>(a)
+        val pb = bitcast<Ptr<Int>>(b)
+        val lenA = pa.offset(1).load()
+        val lenB = pb.offset(1).load()
+        val newLen = lenA + lenB
+        val s = string_pool_alloc(newLen)
+        val p = bitcast<Ptr<Int>>(s)
+        p.offset(0).store(1)            // refCount = 1
+        p.offset(1).store(newLen)       // length
+        p.offset(3).store(0)            // base = NULL
+        if (newLen <= POOL_MAX_LEN) {
+            p.offset(4).store(POOL_MAX_LEN)
+        } else {
+            p.offset(4).store(newLen)
+        }
+        val dataPtr = s + STR_HEADER
+        val charsA = pa.offset(2).load()
+        val charsB = pb.offset(2).load()
+        memcpy(dataPtr, charsA, lenA)
+        memcpy(dataPtr + lenA, charsB, lenB)
+        storeByte(dataPtr, newLen, 0)   // null terminator
+        p.offset(2).store(dataPtr)      // chars → data region
+        return s
+    }
+}
+
+fun stringLength(s: Int): Int {
+    if (s == 0) { return 0 }
+    unsafe {
+        return bitcast<Ptr<Int>>(s).offset(1).load()
+    }
+}
+
+fun rockit_string_length(s: Int): Int {
+    return stringLength(s)
+}
+
+// ── Retain / Release ─────────────────────────────────────────────────────
+
+fun rockit_string_retain(s: Int): Unit {
+    if (s == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val rc = p.offset(0).load()
+        if (rc != ROCKIT_IMMORTAL) {
+            p.offset(0).store(rc + 1)
+        }
+    }
+}
+
+fun rockit_string_release(s: Int): Unit {
+    if (s == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val rc = p.offset(0).load()
+        if (rc == ROCKIT_IMMORTAL) { return }
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            val base = p.offset(3).load()
+            if (base != 0) {
+                rockit_string_release(base)
+                slice_pool_dealloc(s)
+            } else {
+                string_pool_dealloc(s)
+            }
+        } else {
+            p.offset(0).store(newRc)
+        }
+    }
+}
+
+fun rockit_string_dealloc(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val base = p.offset(3).load()
+        if (base != 0) {
+            rockit_string_release(base)
+            slice_pool_dealloc(s)
+        } else {
+            string_pool_dealloc(s)
+        }
+    }
+}
+
+// ── Comparison ───────────────────────────────────────────────────────────
+
+fun rockit_string_eq(a: Int, b: Int): Int {
+    if (a == b) { return 1 }
+    if (a == ROCKIT_NULL) { return 0 }
+    if (b == ROCKIT_NULL) { return 0 }
+    if (a == 0) { return 0 }
+    if (b == 0) { return 0 }
+    if (is_likely_string_ptr(a) == 0) { return 0 }
+    if (is_likely_string_ptr(b) == 0) { return 0 }
+    unsafe {
+        val pa = bitcast<Ptr<Int>>(a)
+        val pb = bitcast<Ptr<Int>>(b)
+        val lenA = pa.offset(1).load()
+        val lenB = pb.offset(1).load()
+        if (lenA != lenB) { return 0 }
+        val charsA = pa.offset(2).load()
+        val charsB = pb.offset(2).load()
+        if (memcmp(charsA, charsB, lenA) == 0) { return 1 }
+    }
+    return 0
+}
+
+fun rockit_string_neq(a: Int, b: Int): Int {
+    if (rockit_string_eq(a, b) == 1) { return 0 }
+    return 1
+}
+
+// ── FNV-1a string hash (for string-keyed maps) ──────────────────────────
+
+fun string_hash(s: Int): Int {
+    if (s == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        // FNV-1a offset basis (truncated to i64)
+        var h: Int = 2166136261
+        var i: Int = 0
+        while (i < len) {
+            val byte = loadByte(chars, i)
+            // XOR then multiply by FNV prime
+            h = (h * 16777619) + byte
+            i = i + 1
+        }
+        // Ensure positive
+        if (h < 0) { h = 0 - h }
+        return h
+    }
+}
+
+// ── Null-terminated C-string helper ──────────────────────────────────────
+// For functions that need null-terminated strings (fopen, system, etc.).
+// Owned and immortal strings are already null-terminated.
+// Slices may not be — copies to heap if needed.
+// Returns a pointer; caller must call cstr_done() to free heap copies.
+
+fun cstr_from_string(s: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val base = p.offset(3).load()
+        val chars = p.offset(2).load()
+        val length = p.offset(1).load()
+        // Owned strings are null-terminated
+        if (base == 0) { return chars }
+        // Slice: check if byte after our range is already '\0'
+        if (loadByte(chars, length) == 0) { return chars }
+        // Need a null-terminated copy
+        val copy = malloc(length + 1)
+        memcpy(copy, chars, length)
+        storeByte(copy, length, 0)
+        return copy
+    }
+}
+
+fun cstr_done(c: Int, s: Int): Unit {
+    unsafe {
+        val chars = bitcast<Ptr<Int>>(s).offset(2).load()
+        if (c != chars) {
+            free(c)
+        }
+    }
+}
+
+// ── Multi-string concatenation ──────────────────────────────────────────
+
+fun rockit_string_concat_n(n: Int, parts: Int): Int {
+    unsafe {
+        val pp = bitcast<Ptr<Int>>(parts)
+        var totalLen: Int = 0
+        var i: Int = 0
+        while (i < n) {
+            val s = pp.offset(i).load()
+            totalLen = totalLen + bitcast<Ptr<Int>>(s).offset(1).load()
+            i = i + 1
+        }
+        if (totalLen == 0) { return rockit_string_new(cstr("")) }
+        val result = string_pool_alloc(totalLen)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)
+        rp.offset(1).store(totalLen)
+        rp.offset(3).store(0)
+        if (totalLen <= POOL_MAX_LEN) {
+            rp.offset(4).store(POOL_MAX_LEN)
+        } else {
+            rp.offset(4).store(totalLen)
+        }
+        val dataPtr = result + STR_HEADER
+        var pos: Int = 0
+        i = 0
+        while (i < n) {
+            val s = pp.offset(i).load()
+            val sp = bitcast<Ptr<Int>>(s)
+            val sLen = sp.offset(1).load()
+            val sChars = sp.offset(2).load()
+            memcpy(dataPtr + pos, sChars, sLen)
+            pos = pos + sLen
+            i = i + 1
+        }
+        storeByte(dataPtr, totalLen, 0)
+        rp.offset(2).store(dataPtr)
+        return result
+    }
+}

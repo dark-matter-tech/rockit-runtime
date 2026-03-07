@@ -1,0 +1,94 @@
+// process.rok — Process, environment, and system operations
+// Depends on: memory.rok, string.rok, list.rok
+
+extern fun getenv(name: Int): Int
+extern fun system(cmd: Int): Int
+extern fun exit(code: Int): Unit
+extern fun uname(buf: Int): Int
+
+var s_argc: Int = 0
+var s_argv: Int = 0
+
+fun rockit_set_args(argc: Int, argv: Int): Unit {
+    s_argc = argc
+    s_argv = argv
+}
+
+fun processArgs(): Int {
+    val list = listCreate()
+    var i: Int = 1
+    while (i < s_argc) {
+        unsafe {
+            val argPtr = bitcast<Ptr<Int>>(s_argv).offset(i).load()
+            val s = rockit_string_new(argPtr)
+            listAppend(list, s)
+        }
+        i = i + 1
+    }
+    return list
+}
+
+fun getEnv(name: Int): Int {
+    unsafe {
+        val c = cstr_from_string(name)
+        val val2 = getenv(c)
+        cstr_done(c, name)
+        if (val2 == 0) {
+            return rockit_string_new(cstr(""))
+        }
+        return rockit_string_new(val2)
+    }
+}
+
+fun executablePath(): Int {
+    if (s_argc > 0) {
+        if (s_argv != 0) {
+            unsafe {
+                val arg0 = bitcast<Ptr<Int>>(s_argv).offset(0).load()
+                if (arg0 != 0) {
+                    return rockit_string_new(arg0)
+                }
+            }
+        }
+    }
+    unsafe { return rockit_string_new(cstr("")) }
+}
+
+fun platformOS(): Int {
+    unsafe {
+        // Use uname() to detect platform at runtime
+        // sysname is the first field: "Darwin" on macOS, "Linux" on Linux
+        val buf = malloc(1024)
+        uname(buf)
+        val first = loadByte(buf, 0)
+        free(buf)
+        if (first == 68) {  // 'D' for Darwin
+            return rockit_string_new(cstr("macos"))
+        }
+        if (first == 76) {  // 'L' for Linux
+            return rockit_string_new(cstr("linux"))
+        }
+        return rockit_string_new(cstr("linux"))
+    }
+}
+
+fun processExit(code: Int): Unit {
+    unsafe {
+        exit(code)
+    }
+}
+
+fun systemExec(cmd: Int): Int {
+    if (cmd == 0) { return 0 - 1 }
+    unsafe {
+        val c = cstr_from_string(cmd)
+        val result = system(c)
+        cstr_done(c, cmd)
+        return result
+    }
+}
+
+fun evalRockit(source: Int): Int {
+    // evalRockit is a VM-specific feature — no-op in native mode
+    return 0
+}

@@ -1,0 +1,200 @@
+// concurrency.rok — Cooperative task scheduler, actors
+// Depends on: memory.rok, object.rok
+//
+// Frame header layout (first 4 i64 slots of every continuation frame):
+//   slot 0: state          (i64)
+//   slot 1: parent_resume  (function pointer)
+//   slot 2: parent_frame   (pointer)
+//   slot 3: join_counter   (i64)
+//
+// Task queue entry layout (3 i64 slots):
+//   slot 0: resume_fn  (function pointer)
+//   slot 1: frame      (pointer)
+//   slot 2: result     (i64)
+
+val TASK_QUEUE_CAP: Int = 4096
+val TASK_SLOTS: Int = 3
+val COROUTINE_SUSPENDED: Int = 0 - 9999
+
+var sched_tasks: Int = 0
+var sched_head: Int = 0
+var sched_tail: Int = 0
+var sched_count: Int = 0
+
+fun sched_ensure_init(): Unit {
+    if (sched_tasks == 0) {
+        unsafe {
+            sched_tasks = calloc(TASK_QUEUE_CAP * TASK_SLOTS, 8)
+        }
+    }
+}
+
+fun rockit_task_schedule(resume_fn: Int, frame: Int, result: Int): Unit {
+    sched_ensure_init()
+    unsafe {
+        if (sched_count >= TASK_QUEUE_CAP) {
+            write(2, cstr("rockit: task queue overflow\n"), 27)
+            exit(1)
+        }
+        val tp = bitcast<Ptr<Int>>(sched_tasks)
+        tp.offset(sched_tail * TASK_SLOTS).store(resume_fn)
+        tp.offset(sched_tail * TASK_SLOTS + 1).store(frame)
+        tp.offset(sched_tail * TASK_SLOTS + 2).store(result)
+        sched_tail = sched_tail + 1
+        if (sched_tail >= TASK_QUEUE_CAP) { sched_tail = 0 }
+        sched_count = sched_count + 1
+    }
+}
+
+fun rockit_frame_alloc(size_bytes: Int): Int {
+    return calloc(1, size_bytes)
+}
+
+fun rockit_frame_free(frame: Int): Unit {
+    free(frame)
+}
+
+fun rockit_await(child_resume_fn: Int, child_frame: Int,
+                 parent_resume_fn: Int, parent_frame: Int): Int {
+    unsafe {
+        // Set up parent continuation in child's frame header
+        val hdr = bitcast<Ptr<Int>>(child_frame)
+        hdr.offset(1).store(parent_resume_fn)
+        hdr.offset(2).store(parent_frame)
+    }
+    rockit_task_schedule(child_resume_fn, child_frame, 0)
+    return COROUTINE_SUSPENDED
+}
+
+fun rockit_run_event_loop(): Unit {
+    while (sched_count > 0) {
+        unsafe {
+            val tp = bitcast<Ptr<Int>>(sched_tasks)
+            val resume_fn = tp.offset(sched_head * TASK_SLOTS).load()
+            val frame = tp.offset(sched_head * TASK_SLOTS + 1).load()
+            val result = tp.offset(sched_head * TASK_SLOTS + 2).load()
+            sched_head = sched_head + 1
+            if (sched_head >= TASK_QUEUE_CAP) { sched_head = 0 }
+            sched_count = sched_count - 1
+
+            // Indirect call: resume_fn(frame, result)
+            val ret = callResumeFn(resume_fn, frame, result)
+
+            if (ret != COROUTINE_SUSPENDED) {
+                // Task completed — resume parent if one exists
+                val hdr = bitcast<Ptr<Int>>(frame)
+                val parent_resume = hdr.offset(1).load()
+                if (parent_resume != 0) {
+                    val parent_frame = hdr.offset(2).load()
+                    // Decrement parent's join counter
+                    val phdr = bitcast<Ptr<Int>>(parent_frame)
+                    val jc = phdr.offset(3).load()
+                    if (jc > 0) {
+                        phdr.offset(3).store(jc - 1)
+                    }
+                    rockit_task_schedule(parent_resume, parent_frame, ret)
+                }
+                rockit_frame_free(frame)
+            }
+        }
+    }
+}
+
+fun rockit_is_suspended(value: Int): Int {
+    if (value == COROUTINE_SUSPENDED) { return 1 }
+    return 0
+}
+
+// ── Type hierarchy (for is-type checking with inheritance) ──────────────
+
+var g_type_table: Int = 0
+var g_type_count: Int = 0
+
+fun rockit_set_type_hierarchy(table: Int, count: Int): Unit {
+    g_type_table = table
+    g_type_count = count
+}
+
+fun find_parent_type(childName: Int): Int {
+    // Each entry is 2 pointers (16 bytes): [child_ptr, parent_ptr]
+    var i: Int = 0
+    while (i < g_type_count) {
+        unsafe {
+            val ep = bitcast<Ptr<Int>>(g_type_table)
+            val child = ep.offset(i * 2).load()
+            // Compare C strings (null-terminated)
+            var j: Int = 0
+            var match: Int = 1
+            while (true) {
+                val a = loadByte(child, j)
+                val b = loadByte(childName, j)
+                if (a != b) {
+                    match = 0
+                    break
+                }
+                if (a == 0) { break }
+                j = j + 1
+            }
+            if (match == 1) {
+                return ep.offset(i * 2 + 1).load()
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fun rockit_is_type(obj: Int, targetType: Int): Int {
+    if (obj == 0) { return 0 }
+    unsafe {
+        var current: Int = bitcast<Ptr<Int>>(obj).offset(0).load()  // typeName
+        while (current != 0) {
+            // Compare C strings
+            var i: Int = 0
+            var match: Int = 1
+            while (true) {
+                val a = loadByte(current, i)
+                val b = loadByte(targetType, i)
+                if (a != b) {
+                    match = 0
+                    break
+                }
+                if (a == 0) { break }
+                i = i + 1
+            }
+            if (match == 1) { return 1 }
+            current = find_parent_type(current)
+        }
+    }
+    return 0
+}
+
+// ── Actor Runtime ──────────────────────────────────────────────────────
+// Actor layout: [object_ptr:i64]
+
+fun rockit_actor_create(typeName: Int, fieldCount: Int): Int {
+    unsafe {
+        val act = malloc(8)
+        val obj = rockit_object_alloc(typeName, fieldCount)
+        bitcast<Ptr<Int>>(act).offset(0).store(obj)
+        return act
+    }
+}
+
+fun rockit_actor_get_object(act: Int): Int {
+    if (act == 0) {
+        unsafe { rockit_panic(cstr("null actor dereference")) }
+    }
+    unsafe {
+        return bitcast<Ptr<Int>>(act).offset(0).load()
+    }
+}
+
+fun rockit_actor_release(act: Int): Unit {
+    if (act == 0) { return }
+    unsafe {
+        val obj = bitcast<Ptr<Int>>(act).offset(0).load()
+        rockit_release(obj)
+        free(act)
+    }
+}

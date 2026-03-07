@@ -1,0 +1,79 @@
+// memory.rok — Core memory management
+// malloc/free wrappers, panic, null sentinel, heap pointer heuristics.
+
+extern fun malloc(size: Int): Int
+extern fun calloc(count: Int, size: Int): Int
+extern fun realloc(ptr: Int, size: Int): Int
+extern fun free(ptr: Int): Unit
+extern fun memcpy(dst: Int, src: Int, n: Int): Int
+extern fun memset(dst: Int, v: Int, n: Int): Int
+extern fun memcmp(a: Int, b: Int, n: Int): Int
+extern fun strlen(s: Int): Int
+extern fun write(fd: Int, buf: Int, count: Int): Int
+extern fun exit(code: Int): Unit
+
+// ── Constants ────────────────────────────────────────────────────────────
+
+val ROCKIT_NULL: Int = 3405691582          // 0xCAFEBABE
+val ROCKIT_IMMORTAL: Int = 9223372036854775807  // INT64_MAX
+
+// ── Panic ────────────────────────────────────────────────────────────────
+
+fun rockit_panic(message: Ptr<Int>): Unit {
+    unsafe {
+        val prefix = cstr("PANIC: ")
+        write(2, prefix, 7)
+        val msg = bitcast<Int>(message)
+        val len = strlen(msg)
+        write(2, msg, len)
+        val nl = cstr("\n")
+        write(2, nl, 1)
+        exit(1)
+    }
+}
+
+// ── Heap pointer heuristic ───────────────────────────────────────────────
+// Checks if a value looks like a valid heap pointer (between 4GB and 128TB).
+
+fun is_likely_heap_ptr(value: Int): Int {
+    if (value == 0) { return 0 }
+    if (value == ROCKIT_NULL) { return 0 }
+    if (value > 4294967296) {
+        if (value < 140737488355328) {
+            return 1
+        }
+    }
+    return 0
+}
+
+// ── String-pointer heuristic ─────────────────────────────────────────────
+// Checks if an i64 value looks like a pointer to a RockitString.
+// RockitString layout: [refCount:i64][length:i64][chars:ptr][base:ptr][data...]
+
+fun is_likely_string_ptr(value: Int): Int {
+    if (value == 0) { return 0 }
+    if (is_likely_heap_ptr(value) == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(value)
+        val refCount = p.offset(0).load()
+        val length = p.offset(1).load()
+        if (refCount == ROCKIT_IMMORTAL) {
+            if (length >= 0) {
+                if (length < 10000000) {
+                    return 1
+                }
+            }
+            return 0
+        }
+        if (refCount > 0) {
+            if (refCount < 100000) {
+                if (length >= 0) {
+                    if (length < 10000000) {
+                        return 1
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}

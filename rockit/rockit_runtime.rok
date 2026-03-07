@@ -1,0 +1,2627 @@
+// math.rok — Math function wrappers
+// Pure libc wrappers, no internal dependencies.
+
+extern fun sqrt(x: Float): Float
+extern fun sin(x: Float): Float
+extern fun cos(x: Float): Float
+extern fun tan(x: Float): Float
+extern fun pow(base: Float, exp: Float): Float
+extern fun floor(x: Float): Float
+extern fun ceil(x: Float): Float
+extern fun round(x: Float): Float
+extern fun log(x: Float): Float
+extern fun exp(x: Float): Float
+extern fun fabs(x: Float): Float
+extern fun atan2(y: Float, x: Float): Float
+
+fun rockit_math_sqrt(x: Float): Float { return sqrt(x) }
+fun rockit_math_sin(x: Float): Float { return sin(x) }
+fun rockit_math_cos(x: Float): Float { return cos(x) }
+fun rockit_math_tan(x: Float): Float { return tan(x) }
+fun rockit_math_pow(base: Float, e: Float): Float { return pow(base, e) }
+fun rockit_math_floor(x: Float): Float { return floor(x) }
+fun rockit_math_ceil(x: Float): Float { return ceil(x) }
+fun rockit_math_round(x: Float): Float { return round(x) }
+fun rockit_math_log(x: Float): Float { return log(x) }
+fun rockit_math_exp(x: Float): Float { return exp(x) }
+fun rockit_math_abs(x: Float): Float { return fabs(x) }
+fun rockit_math_atan2(y: Float, x: Float): Float { return atan2(y, x) }
+
+fun toFloat(value: Int): Float {
+    return bitcast<Float>(value)
+}
+// memory.rok — Core memory management
+// malloc/free wrappers, panic, null sentinel, heap pointer heuristics.
+
+extern fun malloc(size: Int): Int
+extern fun calloc(count: Int, size: Int): Int
+extern fun realloc(ptr: Int, size: Int): Int
+extern fun free(ptr: Int): Unit
+extern fun memcpy(dst: Int, src: Int, n: Int): Int
+extern fun memset(dst: Int, v: Int, n: Int): Int
+extern fun memcmp(a: Int, b: Int, n: Int): Int
+extern fun strlen(s: Int): Int
+extern fun write(fd: Int, buf: Int, count: Int): Int
+extern fun exit(code: Int): Unit
+
+// ── Constants ────────────────────────────────────────────────────────────
+
+val ROCKIT_NULL: Int = 3405691582          // 0xCAFEBABE
+val ROCKIT_IMMORTAL: Int = 9223372036854775807  // INT64_MAX
+
+// ── Panic ────────────────────────────────────────────────────────────────
+
+fun rockit_panic(message: Ptr<Int>): Unit {
+    unsafe {
+        val prefix = cstr("PANIC: ")
+        write(2, prefix, 7)
+        val msg = bitcast<Int>(message)
+        val len = strlen(msg)
+        write(2, msg, len)
+        val nl = cstr("\n")
+        write(2, nl, 1)
+        exit(1)
+    }
+}
+
+// ── Heap pointer heuristic ───────────────────────────────────────────────
+// Checks if a value looks like a valid heap pointer (between 4GB and 128TB).
+
+fun is_likely_heap_ptr(value: Int): Int {
+    if (value == 0) { return 0 }
+    if (value == ROCKIT_NULL) { return 0 }
+    if (value > 4294967296) {
+        if (value < 140737488355328) {
+            return 1
+        }
+    }
+    return 0
+}
+
+// ── String-pointer heuristic ─────────────────────────────────────────────
+// Checks if an i64 value looks like a pointer to a RockitString.
+// RockitString layout: [refCount:i64][length:i64][chars:ptr][base:ptr][data...]
+
+fun is_likely_string_ptr(value: Int): Int {
+    if (value == 0) { return 0 }
+    if (is_likely_heap_ptr(value) == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(value)
+        val refCount = p.offset(0).load()
+        val length = p.offset(1).load()
+        if (refCount == ROCKIT_IMMORTAL) {
+            if (length >= 0) {
+                if (length < 10000000) {
+                    return 1
+                }
+            }
+            return 0
+        }
+        if (refCount > 0) {
+            if (refCount < 100000) {
+                if (length >= 0) {
+                    if (length < 10000000) {
+                        return 1
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}
+// string.rok — RockitString core operations
+// Depends on: memory.rok
+//
+// RockitString layout (matches C struct):
+//   offset 0:  refCount (i64)
+//   offset 8:  length   (i64)
+//   offset 16: chars    (ptr) — points to character data
+//   offset 24: base     (ptr) — non-null for slices (retained reference to owner)
+//   offset 32: capacity (i64) — allocated data capacity in bytes (owned strings only)
+//   offset 40+: data[]  — inline character data (owned strings only)
+//
+// Header size: 40 bytes (5 x i64)
+
+val STR_HEADER: Int = 40
+
+// ── String pool ──────────────────────────────────────────────────────────
+// Free list for small owned strings to avoid malloc/free overhead.
+
+val POOL_MAX_LEN: Int = 48
+val POOL_BLOCK_SIZE: Int = 89  // STR_HEADER(40) + POOL_MAX_LEN(48) + 1
+
+var string_pool_free: Int = 0
+var slice_pool_free: Int = 0
+
+fun string_pool_alloc(len: Int): Int {
+    unsafe {
+        if (len <= POOL_MAX_LEN) {
+            if (string_pool_free != 0) {
+                val s = string_pool_free
+                // Follow free list: next pointer stored at offset 0
+                string_pool_free = bitcast<Ptr<Int>>(s).offset(0).load()
+                return s
+            }
+            return malloc(POOL_BLOCK_SIZE)
+        }
+        return malloc(STR_HEADER + len + 1)
+    }
+}
+
+fun string_pool_dealloc(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val length = p.offset(1).load()
+        if (length <= POOL_MAX_LEN) {
+            // Push onto free list
+            p.offset(0).store(string_pool_free)
+            string_pool_free = s
+        } else {
+            free(s)
+        }
+    }
+}
+
+fun slice_pool_alloc(): Int {
+    unsafe {
+        if (slice_pool_free != 0) {
+            val s = slice_pool_free
+            slice_pool_free = bitcast<Ptr<Int>>(s).offset(0).load()
+            return s
+        }
+        return malloc(STR_HEADER)
+    }
+}
+
+fun slice_pool_dealloc(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        p.offset(0).store(slice_pool_free)
+        slice_pool_free = s
+    }
+}
+
+// ── Core string functions ────────────────────────────────────────────────
+
+fun rockit_string_new(utf8: Int): Int {
+    unsafe {
+        var src: Int = utf8
+        if (src == 0) {
+            src = cstr("")
+        }
+        val len = strlen(src)
+        val s = string_pool_alloc(len)
+        val p = bitcast<Ptr<Int>>(s)
+        p.offset(0).store(1)           // refCount = 1
+        p.offset(1).store(len)         // length
+        p.offset(3).store(0)           // base = NULL
+        if (len <= POOL_MAX_LEN) {
+            p.offset(4).store(POOL_MAX_LEN)  // capacity = pool block size
+        } else {
+            p.offset(4).store(len)           // capacity = exact allocation
+        }
+        val dataPtr = s + STR_HEADER
+        memcpy(dataPtr, src, len + 1)  // copy including null terminator
+        p.offset(2).store(dataPtr)     // chars → data region
+        return s
+    }
+}
+
+fun rockit_string_concat(a: Int, b: Int): Int {
+    // stringConcat wrapper — called as rockit_string_concat
+    return stringConcat(a, b)
+}
+
+// ── Consume-concat: takes ownership of LHS for in-place append ──────────
+// Used by codegen for `s = s + expr` patterns. The caller does NOT retain
+// the LHS — this function either mutates it in-place (if unique & has capacity)
+// or allocates a new string and releases the old one.
+
+fun rockit_string_concat_consume(a: Int, b: Int): Int {
+    unsafe {
+        val pa = bitcast<Ptr<Int>>(a)
+        val rc = pa.offset(0).load()
+        val base = pa.offset(3).load()
+        val lenA = pa.offset(1).load()
+        val pb = bitcast<Ptr<Int>>(b)
+        val lenB = pb.offset(1).load()
+        val newLen = lenA + lenB
+
+        // Fast path: unique owner, not a slice, not immortal
+        if (rc == 1) {
+            if (base == 0) {
+                if (rc != ROCKIT_IMMORTAL) {
+                    val cap = pa.offset(4).load()
+                    if (newLen <= cap) {
+                        // Append in-place — no allocation
+                        val charsA = pa.offset(2).load()
+                        val charsB = pb.offset(2).load()
+                        memcpy(charsA + lenA, charsB, lenB)
+                        storeByte(charsA, newLen, 0)
+                        pa.offset(1).store(newLen)
+                        return a
+                    }
+                    // Grow: realloc with 2x capacity
+                    var newCap: Int = cap * 2
+                    if (newCap < newLen) { newCap = newLen }
+                    val newBlock = realloc(a, STR_HEADER + newCap + 1)
+                    val np = bitcast<Ptr<Int>>(newBlock)
+                    val newDataPtr = newBlock + STR_HEADER
+                    val charsB2 = pb.offset(2).load()
+                    memcpy(newDataPtr + lenA, charsB2, lenB)
+                    storeByte(newDataPtr, newLen, 0)
+                    np.offset(1).store(newLen)
+                    np.offset(2).store(newDataPtr)
+                    np.offset(4).store(newCap)
+                    return newBlock
+                }
+            }
+        }
+
+        // Slow path: not unique or slice — allocate new, release old
+        val result = stringConcat(a, b)
+        rockit_string_release(a)
+        return result
+    }
+}
+
+fun stringConcat(a: Int, b: Int): Int {
+    unsafe {
+        val pa = bitcast<Ptr<Int>>(a)
+        val pb = bitcast<Ptr<Int>>(b)
+        val lenA = pa.offset(1).load()
+        val lenB = pb.offset(1).load()
+        val newLen = lenA + lenB
+        val s = string_pool_alloc(newLen)
+        val p = bitcast<Ptr<Int>>(s)
+        p.offset(0).store(1)            // refCount = 1
+        p.offset(1).store(newLen)       // length
+        p.offset(3).store(0)            // base = NULL
+        if (newLen <= POOL_MAX_LEN) {
+            p.offset(4).store(POOL_MAX_LEN)
+        } else {
+            p.offset(4).store(newLen)
+        }
+        val dataPtr = s + STR_HEADER
+        val charsA = pa.offset(2).load()
+        val charsB = pb.offset(2).load()
+        memcpy(dataPtr, charsA, lenA)
+        memcpy(dataPtr + lenA, charsB, lenB)
+        storeByte(dataPtr, newLen, 0)   // null terminator
+        p.offset(2).store(dataPtr)      // chars → data region
+        return s
+    }
+}
+
+fun stringLength(s: Int): Int {
+    if (s == 0) { return 0 }
+    unsafe {
+        return bitcast<Ptr<Int>>(s).offset(1).load()
+    }
+}
+
+fun rockit_string_length(s: Int): Int {
+    return stringLength(s)
+}
+
+// ── Retain / Release ─────────────────────────────────────────────────────
+
+fun rockit_string_retain(s: Int): Unit {
+    if (s == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val rc = p.offset(0).load()
+        if (rc != ROCKIT_IMMORTAL) {
+            p.offset(0).store(rc + 1)
+        }
+    }
+}
+
+fun rockit_string_release(s: Int): Unit {
+    if (s == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val rc = p.offset(0).load()
+        if (rc == ROCKIT_IMMORTAL) { return }
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            val base = p.offset(3).load()
+            if (base != 0) {
+                rockit_string_release(base)
+                slice_pool_dealloc(s)
+            } else {
+                string_pool_dealloc(s)
+            }
+        } else {
+            p.offset(0).store(newRc)
+        }
+    }
+}
+
+fun rockit_string_dealloc(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val base = p.offset(3).load()
+        if (base != 0) {
+            rockit_string_release(base)
+            slice_pool_dealloc(s)
+        } else {
+            string_pool_dealloc(s)
+        }
+    }
+}
+
+// ── Comparison ───────────────────────────────────────────────────────────
+
+fun rockit_string_eq(a: Int, b: Int): Int {
+    if (a == b) { return 1 }
+    if (a == ROCKIT_NULL) { return 0 }
+    if (b == ROCKIT_NULL) { return 0 }
+    if (a == 0) { return 0 }
+    if (b == 0) { return 0 }
+    if (is_likely_string_ptr(a) == 0) { return 0 }
+    if (is_likely_string_ptr(b) == 0) { return 0 }
+    unsafe {
+        val pa = bitcast<Ptr<Int>>(a)
+        val pb = bitcast<Ptr<Int>>(b)
+        val lenA = pa.offset(1).load()
+        val lenB = pb.offset(1).load()
+        if (lenA != lenB) { return 0 }
+        val charsA = pa.offset(2).load()
+        val charsB = pb.offset(2).load()
+        if (memcmp(charsA, charsB, lenA) == 0) { return 1 }
+    }
+    return 0
+}
+
+fun rockit_string_neq(a: Int, b: Int): Int {
+    if (rockit_string_eq(a, b) == 1) { return 0 }
+    return 1
+}
+
+// ── FNV-1a string hash (for string-keyed maps) ──────────────────────────
+
+fun string_hash(s: Int): Int {
+    if (s == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        // FNV-1a offset basis (truncated to i64)
+        var h: Int = 2166136261
+        var i: Int = 0
+        while (i < len) {
+            val byte = loadByte(chars, i)
+            // XOR then multiply by FNV prime
+            h = (h * 16777619) + byte
+            i = i + 1
+        }
+        // Ensure positive
+        if (h < 0) { h = 0 - h }
+        return h
+    }
+}
+
+// ── Null-terminated C-string helper ──────────────────────────────────────
+// For functions that need null-terminated strings (fopen, system, etc.).
+// Owned and immortal strings are already null-terminated.
+// Slices may not be — copies to heap if needed.
+// Returns a pointer; caller must call cstr_done() to free heap copies.
+
+fun cstr_from_string(s: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val base = p.offset(3).load()
+        val chars = p.offset(2).load()
+        val length = p.offset(1).load()
+        // Owned strings are null-terminated
+        if (base == 0) { return chars }
+        // Slice: check if byte after our range is already '\0'
+        if (loadByte(chars, length) == 0) { return chars }
+        // Need a null-terminated copy
+        val copy = malloc(length + 1)
+        memcpy(copy, chars, length)
+        storeByte(copy, length, 0)
+        return copy
+    }
+}
+
+fun cstr_done(c: Int, s: Int): Unit {
+    unsafe {
+        val chars = bitcast<Ptr<Int>>(s).offset(2).load()
+        if (c != chars) {
+            free(c)
+        }
+    }
+}
+
+// ── Multi-string concatenation ──────────────────────────────────────────
+
+fun rockit_string_concat_n(n: Int, parts: Int): Int {
+    unsafe {
+        val pp = bitcast<Ptr<Int>>(parts)
+        var totalLen: Int = 0
+        var i: Int = 0
+        while (i < n) {
+            val s = pp.offset(i).load()
+            totalLen = totalLen + bitcast<Ptr<Int>>(s).offset(1).load()
+            i = i + 1
+        }
+        if (totalLen == 0) { return rockit_string_new(cstr("")) }
+        val result = string_pool_alloc(totalLen)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)
+        rp.offset(1).store(totalLen)
+        rp.offset(3).store(0)
+        if (totalLen <= POOL_MAX_LEN) {
+            rp.offset(4).store(POOL_MAX_LEN)
+        } else {
+            rp.offset(4).store(totalLen)
+        }
+        val dataPtr = result + STR_HEADER
+        var pos: Int = 0
+        i = 0
+        while (i < n) {
+            val s = pp.offset(i).load()
+            val sp = bitcast<Ptr<Int>>(s)
+            val sLen = sp.offset(1).load()
+            val sChars = sp.offset(2).load()
+            memcpy(dataPtr + pos, sChars, sLen)
+            pos = pos + sLen
+            i = i + 1
+        }
+        storeByte(dataPtr, totalLen, 0)
+        rp.offset(2).store(dataPtr)
+        return result
+    }
+}
+// string_ops.rok — String builtin operations
+// Depends on: memory.rok, string.rok
+
+extern fun strtoll(str: Int, endptr: Int, base: Int): Int
+
+// ── Character access ─────────────────────────────────────────────────────
+
+fun charAt(s: Int, index: Int): Int {
+    if (s == 0) { return rockit_string_new(0) }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        if (index < 0) { return rockit_string_new(0) }
+        if (index >= len) { return rockit_string_new(0) }
+        val chars = p.offset(2).load()
+        val ch = loadByte(chars, index)
+        // Build a 1-char string
+        val result = string_pool_alloc(1)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)          // refCount
+        rp.offset(1).store(1)          // length
+        rp.offset(3).store(0)          // base = NULL
+        rp.offset(4).store(POOL_MAX_LEN) // capacity
+        val dataPtr = result + STR_HEADER
+        storeByte(dataPtr, 0, ch)
+        storeByte(dataPtr, 1, 0)       // null terminator
+        rp.offset(2).store(dataPtr)    // chars
+        return result
+    }
+}
+
+fun charCodeAt(s: Int, index: Int): Int {
+    if (s == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        if (index < 0) { return 0 }
+        if (index >= len) { return 0 }
+        val chars = p.offset(2).load()
+        return loadByte(chars, index)
+    }
+}
+
+fun intToChar(code: Int): Int {
+    if (code < 0) { return rockit_string_new(0) }
+    if (code > 127) { return rockit_string_new(0) }
+    unsafe {
+        val result = string_pool_alloc(1)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)          // refCount
+        rp.offset(1).store(1)          // length
+        rp.offset(3).store(0)          // base = NULL
+        rp.offset(4).store(POOL_MAX_LEN) // capacity
+        val dataPtr = result + STR_HEADER
+        storeByte(dataPtr, 0, code)
+        storeByte(dataPtr, 1, 0)       // null terminator
+        rp.offset(2).store(dataPtr)    // chars
+        return result
+    }
+}
+
+// ── Prefix / suffix ──────────────────────────────────────────────────────
+
+fun startsWith(s: Int, prefix: Int): Int {
+    if (s == 0) { return 0 }
+    if (prefix == 0) { return 0 }
+    unsafe {
+        val ps = bitcast<Ptr<Int>>(s)
+        val pp = bitcast<Ptr<Int>>(prefix)
+        val sLen = ps.offset(1).load()
+        val pLen = pp.offset(1).load()
+        if (pLen > sLen) { return 0 }
+        val sChars = ps.offset(2).load()
+        val pChars = pp.offset(2).load()
+        if (memcmp(sChars, pChars, pLen) == 0) { return 1 }
+    }
+    return 0
+}
+
+fun endsWith(s: Int, suffix: Int): Int {
+    if (s == 0) { return 0 }
+    if (suffix == 0) { return 0 }
+    unsafe {
+        val ps = bitcast<Ptr<Int>>(s)
+        val px = bitcast<Ptr<Int>>(suffix)
+        val sLen = ps.offset(1).load()
+        val xLen = px.offset(1).load()
+        if (xLen > sLen) { return 0 }
+        val sChars = ps.offset(2).load()
+        val xChars = px.offset(2).load()
+        if (memcmp(sChars + sLen - xLen, xChars, xLen) == 0) { return 1 }
+    }
+    return 0
+}
+
+// ── Search ───────────────────────────────────────────────────────────────
+
+fun stringIndexOf(s: Int, needle: Int): Int {
+    if (s == 0) { return 0 - 1 }
+    if (needle == 0) { return 0 - 1 }
+    unsafe {
+        val ps = bitcast<Ptr<Int>>(s)
+        val pn = bitcast<Ptr<Int>>(needle)
+        val sLen = ps.offset(1).load()
+        val nLen = pn.offset(1).load()
+        if (nLen == 0) { return 0 }
+        if (nLen > sLen) { return 0 - 1 }
+        val sChars = ps.offset(2).load()
+        val nChars = pn.offset(2).load()
+        var i: Int = 0
+        while (i <= sLen - nLen) {
+            if (memcmp(sChars + i, nChars, nLen) == 0) {
+                return i
+            }
+            i = i + 1
+        }
+    }
+    return 0 - 1
+}
+
+// ── Trim ─────────────────────────────────────────────────────────────────
+
+fun stringTrim(s: Int): Int {
+    if (s == 0) { return rockit_string_new(0) }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        if (len == 0) { return rockit_string_new(0) }
+        val chars = p.offset(2).load()
+        var start: Int = 0
+        while (start < len) {
+            val ch = loadByte(chars, start)
+            if (ch != 32) {  // space
+                if (ch != 9) {  // tab
+                    if (ch != 10) {  // newline
+                        if (ch != 13) {  // carriage return
+                            // not whitespace
+                            break
+                        }
+                    }
+                }
+            }
+            start = start + 1
+        }
+        var end: Int = len - 1
+        while (end > start) {
+            val ch = loadByte(chars, end)
+            if (ch != 32) {
+                if (ch != 9) {
+                    if (ch != 10) {
+                        if (ch != 13) {
+                            break
+                        }
+                    }
+                }
+            }
+            end = end - 1
+        }
+        val trimLen = end - start + 1
+        val result = string_pool_alloc(trimLen)
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)
+        rp.offset(1).store(trimLen)
+        rp.offset(3).store(0)
+        if (trimLen <= POOL_MAX_LEN) {
+            rp.offset(4).store(POOL_MAX_LEN)
+        } else {
+            rp.offset(4).store(trimLen)
+        }
+        val dataPtr = result + STR_HEADER
+        memcpy(dataPtr, chars + start, trimLen)
+        storeByte(dataPtr, trimLen, 0)
+        rp.offset(2).store(dataPtr)
+        return result
+    }
+}
+
+// ── Substring (zero-copy slice) ──────────────────────────────────────────
+
+fun substring(s: Int, start: Int, end: Int): Int {
+    if (s == 0) { return rockit_string_new(0) }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        var st: Int = start
+        var en: Int = end
+        if (st < 0) { st = 0 }
+        if (en > len) { en = len }
+        if (st >= en) { return rockit_string_new(0) }
+        val chars = p.offset(2).load()
+        val base = p.offset(3).load()
+        // Create a zero-copy slice
+        val result = slice_pool_alloc()
+        val rp = bitcast<Ptr<Int>>(result)
+        rp.offset(0).store(1)              // refCount = 1
+        rp.offset(1).store(en - st)        // length
+        rp.offset(2).store(chars + st)     // chars → into source data
+        // Chain to root: if source is a slice, reference its base
+        if (base != 0) {
+            rp.offset(3).store(base)
+            rockit_string_retain(base)
+        } else {
+            rp.offset(3).store(s)
+            rockit_string_retain(s)
+        }
+        return result
+    }
+}
+
+// ── Conversion ───────────────────────────────────────────────────────────
+
+fun toString(value: Int): Int {
+    if (value == ROCKIT_NULL) { return toString_null() }
+    if (value == 0) { return rockit_int_to_string(value) }
+    if (is_likely_string_ptr(value) == 1) { return value }
+    return rockit_int_to_string(value)
+}
+
+fun toString_null(): Int {
+    unsafe { return rockit_string_new(cstr("null")) }
+    return 0
+}
+
+fun rockit_int_to_string(value: Int): Int {
+    unsafe {
+        // Max i64 is 19 digits + sign + null = 21 chars
+        val buf = malloc(32)
+        // Manual int-to-string conversion
+        var v: Int = value
+        var negative: Int = 0
+        if (v < 0) {
+            negative = 1
+            v = 0 - v
+        }
+        var pos: Int = 30
+        storeByte(buf, 31, 0)  // null terminator
+        if (v == 0) {
+            storeByte(buf, pos, 48)  // '0'
+            pos = pos - 1
+        } else {
+            while (v > 0) {
+                val digit = v - (v / 10) * 10  // v % 10
+                storeByte(buf, pos, 48 + digit)  // '0' + digit
+                pos = pos - 1
+                v = v / 10
+            }
+        }
+        if (negative == 1) {
+            storeByte(buf, pos, 45)  // '-'
+            pos = pos - 1
+        }
+        val start = buf + pos + 1
+        val result = rockit_string_new(start)
+        free(buf)
+        return result
+    }
+}
+
+fun toInt(value: Int): Int {
+    if (value == ROCKIT_NULL) { return 0 }
+    if (value == 0) { return 0 }
+    if (is_likely_string_ptr(value) != 1) { return value }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(value)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        var bufLen: Int = len
+        if (bufLen > 31) { bufLen = 31 }
+        val buf = malloc(32)
+        memcpy(buf, chars, bufLen)
+        storeByte(buf, bufLen, 0)
+        val result = strtoll(buf, 0, 10)
+        free(buf)
+        return result
+    }
+    return value
+}
+
+// ── Character checks ─────────────────────────────────────────────────────
+
+fun isDigit(ch: Int): Int {
+    if (ch == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(ch)
+        val len = p.offset(1).load()
+        if (len == 0) { return 0 }
+        val chars = p.offset(2).load()
+        val c = loadByte(chars, 0)
+        if (c >= 48) {   // '0'
+            if (c <= 57) {  // '9'
+                return 1
+            }
+        }
+    }
+    return 0
+}
+
+fun isLetter(ch: Int): Int {
+    if (ch == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(ch)
+        val len = p.offset(1).load()
+        if (len == 0) { return 0 }
+        val chars = p.offset(2).load()
+        val c = loadByte(chars, 0)
+        if (c >= 97) {
+            if (c <= 122) { return 1 }  // a-z
+        }
+        if (c >= 65) {
+            if (c <= 90) { return 1 }   // A-Z
+        }
+        if (c == 95) { return 1 }       // _
+    }
+    return 0
+}
+
+fun isLetterOrDigit(ch: Int): Int {
+    if (isLetter(ch) == 1) { return 1 }
+    return isDigit(ch)
+}
+
+fun isIdentCodePoint(cp: Int): Int {
+    // a-z, A-Z, 0-9, _
+    if (cp >= 97) {
+        if (cp <= 122) { return 1 }
+    }
+    if (cp >= 65) {
+        if (cp <= 90) { return 1 }
+    }
+    if (cp >= 48) {
+        if (cp <= 57) { return 1 }
+    }
+    if (cp == 95) { return 1 }
+    return 0
+}
+
+// ── Type checks ──────────────────────────────────────────────────────────
+
+fun isMap(val2: Int): Int {
+    if (val2 != 0) {
+        if (val2 != ROCKIT_NULL) {
+            return 1
+        }
+    }
+    return 0
+}
+
+// ── Float-to-string ──────────────────────────────────────────────────────
+
+extern fun snprintf(buf: Int, size: Int, fmt: Int, val2: Int): Int
+
+fun floatToString(value: Float): Int {
+    unsafe {
+        val buf = malloc(64)
+        val fmt = cstr("%g")
+        snprintf(buf, 64, fmt, bitcast<Int>(value))
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+
+fun rockit_double_to_string(value: Float): Int {
+    return floatToString(value)
+}
+
+fun rockit_float_to_string(value: Float): Int {
+    unsafe {
+        val s = floatToString(value)
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        // Check if string needs ".0" suffix
+        var needsDot: Int = 1
+        var i: Int = 0
+        while (i < len) {
+            val ch = loadByte(chars, i)
+            if (ch == 46) {
+                needsDot = 0
+                break
+            }
+            if (ch == 101) {
+                needsDot = 0
+                break
+            }
+            if (ch == 69) {
+                needsDot = 0
+                break
+            }
+            i = i + 1
+        }
+        if (needsDot == 1) {
+            val dotZero = rockit_string_new(cstr(".0"))
+            val result = stringConcat(s, dotZero)
+            rockit_string_release(s)
+            rockit_string_release(dotZero)
+            return result
+        }
+        return s
+    }
+}
+
+fun rockit_bool_to_string(value: Int): Int {
+    unsafe {
+        if (value != 0) {
+            return rockit_string_new(cstr("true"))
+        }
+        return rockit_string_new(cstr("false"))
+    }
+}
+
+fun formatFloat(value: Float, decimals: Int): Int {
+    unsafe {
+        val buf = malloc(64)
+        // Build format string "%.<decimals>f"
+        val fmt = malloc(16)
+        storeByte(fmt, 0, 37)   // '%'
+        storeByte(fmt, 1, 46)   // '.'
+        // Convert decimals to chars (simple: assume 0-9)
+        storeByte(fmt, 2, 48 + decimals)  // '0' + decimals
+        storeByte(fmt, 3, 102)  // 'f'
+        storeByte(fmt, 4, 0)    // null terminator
+        snprintf(buf, 64, fmt, bitcast<Int>(value))
+        free(fmt)
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+// object.rok — RockitObject allocation, field access, type checking
+// Depends on: memory.rok
+//
+// RockitObject layout:
+//   offset 0:  typeName     (ptr)  — C string pointer
+//   offset 8:  refCount     (i64)
+//   offset 16: fieldCount   (i32) + ptrFieldBits (u32) — packed into i64
+//   offset 24+: fields[]    (i64 each)
+
+val OBJ_TYPENAME: Int = 0
+val OBJ_REFCOUNT: Int = 1
+val OBJ_FIELDINFO: Int = 2
+val OBJ_FIELDS: Int = 3
+
+fun rockit_object_alloc(typeName: Int, fieldCount: Int): Int {
+    unsafe {
+        val size = 24 + fieldCount * 8
+        val obj = malloc(size)
+        val p = bitcast<Ptr<Int>>(obj)
+        p.offset(OBJ_TYPENAME).store(typeName)
+        p.offset(OBJ_REFCOUNT).store(1)
+        // Pack fieldCount (lower 32 bits) and ptrFieldBits=0xFFFFFFFF (upper 32 bits)
+        // 0xFFFFFFFF << 32 = 0xFFFFFFFF00000000
+        val fieldInfo = 4294967295 * 4294967296 + fieldCount
+        p.offset(OBJ_FIELDINFO).store(fieldInfo)
+        // Zero-initialize fields
+        var i: Int = 0
+        while (i < fieldCount) {
+            p.offset(OBJ_FIELDS + i).store(0)
+            i = i + 1
+        }
+        return obj
+    }
+}
+
+fun rockit_object_get_field(obj: Int, index: Int): Int {
+    if (obj == 0) {
+        unsafe { rockit_panic(cstr("null pointer dereference in field access")) }
+    }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        return p.offset(OBJ_FIELDS + index).load()
+    }
+}
+
+fun rockit_object_set_field(obj: Int, index: Int, value: Int): Unit {
+    if (obj == 0) {
+        unsafe { rockit_panic(cstr("null pointer dereference in field set")) }
+    }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        p.offset(OBJ_FIELDS + index).store(value)
+    }
+}
+
+fun rockit_retain(obj: Int): Unit {
+    if (obj == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        val rc = p.offset(OBJ_REFCOUNT).load()
+        if (rc >= 0) {
+            p.offset(OBJ_REFCOUNT).store(rc + 1)
+        }
+    }
+}
+
+fun rockit_release(obj: Int): Unit {
+    if (obj == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        val rc = p.offset(OBJ_REFCOUNT).load()
+        if (rc < 0) { return }
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            // Get field count from lower 32 bits of fieldInfo
+            val fieldInfo = p.offset(OBJ_FIELDINFO).load()
+            val fieldCount = fieldInfo - (fieldInfo / 4294967296) * 4294967296
+            // Release all field values (conservative)
+            var i: Int = 0
+            while (i < fieldCount) {
+                rockit_release_value(p.offset(OBJ_FIELDS + i).load())
+                i = i + 1
+            }
+            free(obj)
+        } else {
+            p.offset(OBJ_REFCOUNT).store(newRc)
+        }
+    }
+}
+
+// ── Universal Value ARC ──────────────────────────────────────────────────
+
+fun rockit_retain_value(val2: Int): Unit {
+    if (is_likely_heap_ptr(val2) == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(val2)
+        val first = p.offset(0).load()
+        if (first == ROCKIT_IMMORTAL) { return }
+        if (is_likely_heap_ptr(first) == 1) {
+            // RockitObject: refCount at offset 1
+            val rc = p.offset(1).load()
+            p.offset(1).store(rc + 1)
+        } else {
+            // String/List/Map: refCount at offset 0
+            p.offset(0).store(first + 1)
+        }
+    }
+}
+
+fun rockit_release_value(val2: Int): Unit {
+    if (is_likely_heap_ptr(val2) == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(val2)
+        val first = p.offset(0).load()
+        if (first == ROCKIT_IMMORTAL) { return }
+        if (is_likely_heap_ptr(first) == 1) {
+            // RockitObject: refCount at offset 1
+            val rc = p.offset(1).load()
+            val newRc = rc - 1
+            if (newRc <= 0) {
+                val fieldInfo = p.offset(2).load()
+                val fieldCount = fieldInfo - (fieldInfo / 4294967296) * 4294967296
+                var i: Int = 0
+                while (i < fieldCount) {
+                    rockit_release_value(p.offset(3 + i).load())
+                    i = i + 1
+                }
+                free(val2)
+            } else {
+                p.offset(1).store(newRc)
+            }
+        } else {
+            // String/List/Map: refCount at offset 0
+            val newRc = first - 1
+            if (newRc <= 0) {
+                free(val2)
+            } else {
+                p.offset(0).store(newRc)
+            }
+        }
+    }
+}
+
+// ── Type checking ────────────────────────────────────────────────────────
+
+fun rockit_object_is_type(obj: Int, typeName: Int): Int {
+    if (obj == 0) { return 0 }
+    if (typeName == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(obj)
+        val objType = p.offset(OBJ_TYPENAME).load()
+        // Compare type name strings (C strings, use strcmp-like logic)
+        var i: Int = 0
+        while (true) {
+            val a = loadByte(objType, i)
+            val b = loadByte(typeName, i)
+            if (a != b) { return 0 }
+            if (a == 0) { return 1 }
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+fun rockit_object_get_type_name(obj: Int): Int {
+    if (obj == 0) { return 0 }
+    unsafe {
+        return bitcast<Ptr<Int>>(obj).offset(OBJ_TYPENAME).load()
+    }
+}
+// list.rok — RockitList dynamic array
+// Depends on: memory.rok, object.rok (for rockit_retain_value/release_value)
+//
+// RockitList layout:
+//   offset 0: refCount  (i64)
+//   offset 8: size      (i64)
+//   offset 16: capacity (i64)
+//   offset 24: data     (ptr) — pointer to i64 array
+
+val LIST_REFCOUNT: Int = 0
+val LIST_SIZE: Int = 1
+val LIST_CAPACITY: Int = 2
+val LIST_DATA: Int = 3
+val LIST_HEADER: Int = 32
+
+fun rockit_list_create(): Int {
+    unsafe {
+        val list = malloc(LIST_HEADER)
+        val p = bitcast<Ptr<Int>>(list)
+        p.offset(LIST_REFCOUNT).store(1)
+        p.offset(LIST_SIZE).store(0)
+        p.offset(LIST_CAPACITY).store(8)
+        p.offset(LIST_DATA).store(malloc(64))  // 8 * sizeof(i64)
+        return list
+    }
+}
+
+fun listCreate(): Int {
+    return rockit_list_create()
+}
+
+fun rockit_list_append(list: Int, value: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        val cap = p.offset(LIST_CAPACITY).load()
+        if (size >= cap) {
+            val newCap = cap * 2
+            val oldData = p.offset(LIST_DATA).load()
+            val newData = realloc(oldData, newCap * 8)
+            p.offset(LIST_DATA).store(newData)
+            p.offset(LIST_CAPACITY).store(newCap)
+        }
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        dp.offset(size).store(value)
+        p.offset(LIST_SIZE).store(size + 1)
+    }
+}
+
+fun listAppend(list: Int, value: Int): Unit {
+    rockit_list_append(list, value)
+}
+
+fun rockit_list_get(list: Int, index: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { rockit_panic(cstr("list index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("list index out of bounds")) }
+        val arr = p.offset(LIST_DATA).load()
+        return bitcast<Ptr<Int>>(arr).offset(index).load()
+    }
+}
+
+fun listGet(list: Int, index: Int): Int {
+    return rockit_list_get(list, index)
+}
+
+fun rockit_list_set(list: Int, index: Int, value: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { rockit_panic(cstr("list index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("list index out of bounds")) }
+        val arr = p.offset(LIST_DATA).load()
+        bitcast<Ptr<Int>>(arr).offset(index).store(value)
+    }
+}
+
+fun listSet(list: Int, index: Int, value: Int): Unit {
+    rockit_list_set(list, index, value)
+}
+
+fun rockit_list_size(list: Int): Int {
+    if (list == 0) { return 0 }
+    unsafe {
+        return bitcast<Ptr<Int>>(list).offset(LIST_SIZE).load()
+    }
+}
+
+fun listSize(list: Int): Int {
+    return rockit_list_size(list)
+}
+
+fun listContains(list: Int, value: Int): Int {
+    if (list == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        var i: Int = 0
+        while (i < size) {
+            if (dp.offset(i).load() == value) { return 1 }
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+fun listRemoveAt(list: Int, index: Int): Int {
+    if (list == 0) { return ROCKIT_NULL }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { return ROCKIT_NULL }
+        if (index >= size) { return ROCKIT_NULL }
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        val removed = dp.offset(index).load()
+        var i: Int = index
+        while (i < size - 1) {
+            dp.offset(i).store(dp.offset(i + 1).load())
+            i = i + 1
+        }
+        p.offset(LIST_SIZE).store(size - 1)
+        return removed
+    }
+}
+
+fun rockit_list_contains(list: Int, value: Int): Int {
+    return listContains(list, value)
+}
+
+fun rockit_list_remove_at(list: Int, index: Int): Int {
+    return listRemoveAt(list, index)
+}
+
+fun rockit_list_create_filled(size: Int, value: Int): Int {
+    unsafe {
+        val list = malloc(LIST_HEADER)
+        val p = bitcast<Ptr<Int>>(list)
+        p.offset(LIST_REFCOUNT).store(1)
+        p.offset(LIST_SIZE).store(size)
+        var cap: Int = size
+        if (cap <= 0) { cap = 8 }
+        p.offset(LIST_CAPACITY).store(cap)
+        val arr = malloc(cap * 8)
+        if (value == 0) {
+            memset(arr, 0, size * 8)
+        } else {
+            val dp = bitcast<Ptr<Int>>(arr)
+            var i: Int = 0
+            while (i < size) {
+                dp.offset(i).store(value)
+                i = i + 1
+            }
+        }
+        p.offset(LIST_DATA).store(arr)
+        return list
+    }
+}
+
+fun listCreateFilled(size: Int, value: Int): Int {
+    return rockit_list_create_filled(size, value)
+}
+
+fun rockit_list_is_empty(list: Int): Int {
+    if (list == 0) { return 1 }
+    unsafe {
+        if (bitcast<Ptr<Int>>(list).offset(LIST_SIZE).load() == 0) { return 1 }
+    }
+    return 0
+}
+
+fun rockit_list_release(list: Int): Unit {
+    if (list == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val rc = p.offset(LIST_REFCOUNT).load()
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            val size = p.offset(LIST_SIZE).load()
+            val arr = p.offset(LIST_DATA).load()
+            val dp = bitcast<Ptr<Int>>(arr)
+            var i: Int = 0
+            while (i < size) {
+                rockit_release_value(dp.offset(i).load())
+                i = i + 1
+            }
+            free(arr)
+            free(list)
+        } else {
+            p.offset(LIST_REFCOUNT).store(newRc)
+        }
+    }
+}
+
+fun rockit_list_clear(list: Int): Unit {
+    if (list == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        val arr = p.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        var i: Int = 0
+        while (i < size) {
+            rockit_release_value(dp.offset(i).load())
+            i = i + 1
+        }
+        p.offset(LIST_SIZE).store(0)
+    }
+}
+
+fun listClear(list: Int): Unit {
+    rockit_list_clear(list)
+}
+
+fun listSetFloat(list: Int, index: Int, value: Float): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { return }
+        if (index >= size) { return }
+        val arr = p.offset(LIST_DATA).load()
+        bitcast<Ptr<Int>>(arr).offset(index).store(bitcast<Int>(value))
+    }
+}
+
+fun listGetFloat(list: Int, index: Int): Float {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(list)
+        val size = p.offset(LIST_SIZE).load()
+        if (index < 0) { return bitcast<Float>(0) }
+        if (index >= size) { return bitcast<Float>(0) }
+        val arr = p.offset(LIST_DATA).load()
+        return bitcast<Float>(bitcast<Ptr<Int>>(arr).offset(index).load())
+    }
+}
+
+// ── ByteArray ────────────────────────────────────────────────────────────
+// Compact byte buffer: 1 byte per element (vs 8 for List).
+// Layout: refCount(i64) | size(i64) | data[](i8 inline)
+// Header = 16 bytes (2 x i64), data starts at offset 16.
+
+val BYTE_ARRAY_HEADER: Int = 16
+
+fun byteArrayCreate(size: Int): Int {
+    unsafe {
+        val arr = calloc(1, BYTE_ARRAY_HEADER + size)
+        val p = bitcast<Ptr<Int>>(arr)
+        p.offset(0).store(1)      // refCount = 1
+        p.offset(1).store(size)   // size
+        return arr
+    }
+}
+
+fun byteArrayCreateFilled(size: Int, value: Int): Int {
+    unsafe {
+        val arr = malloc(BYTE_ARRAY_HEADER + size)
+        val p = bitcast<Ptr<Int>>(arr)
+        p.offset(0).store(1)      // refCount = 1
+        p.offset(1).store(size)   // size
+        memset(arr + BYTE_ARRAY_HEADER, value, size)
+        return arr
+    }
+}
+
+fun byteArrayGet(arr: Int, index: Int): Int {
+    unsafe {
+        val size = bitcast<Ptr<Int>>(arr).offset(1).load()
+        if (index < 0) { rockit_panic(cstr("byteArray index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("byteArray index out of bounds")) }
+        return loadByte(arr + BYTE_ARRAY_HEADER, index)
+    }
+}
+
+fun byteArraySet(arr: Int, index: Int, value: Int): Unit {
+    unsafe {
+        val size = bitcast<Ptr<Int>>(arr).offset(1).load()
+        if (index < 0) { rockit_panic(cstr("byteArray index out of bounds")) }
+        if (index >= size) { rockit_panic(cstr("byteArray index out of bounds")) }
+        storeByte(arr + BYTE_ARRAY_HEADER, index, value)
+    }
+}
+
+fun byteArraySize(arr: Int): Int {
+    unsafe {
+        return bitcast<Ptr<Int>>(arr).offset(1).load()
+    }
+}
+// map.rok — String-keyed and integer-keyed hash maps
+// Depends on: memory.rok, string.rok, list.rok
+//
+// Map layout (shared by StringMap and IntMap):
+//   offset 0: refCount  (i64)
+//   offset 8: size      (i64)
+//   offset 16: capacity (i64)
+//   offset 24: entries   (ptr) — pointer to entry array
+//
+// Entry layout (3 i64 slots per entry):
+//   slot 0: key       (ptr or i64)
+//   slot 1: value     (i64)
+//   slot 2: occupied  (i64, 0 or 1)
+
+val MAP_REFCOUNT: Int = 0
+val MAP_SIZE: Int = 1
+val MAP_CAPACITY: Int = 2
+val MAP_ENTRIES: Int = 3
+val MAP_HEADER: Int = 32
+val ENTRY_SLOTS: Int = 3
+
+// ── Entry helpers ───────────────────────────────────────────────────────
+
+fun entry_key(entries: Int, idx: Int): Int {
+    unsafe { return bitcast<Ptr<Int>>(entries).offset(idx * ENTRY_SLOTS).load() }
+}
+
+fun entry_value(entries: Int, idx: Int): Int {
+    unsafe { return bitcast<Ptr<Int>>(entries).offset(idx * ENTRY_SLOTS + 1).load() }
+}
+
+fun entry_occupied(entries: Int, idx: Int): Int {
+    unsafe { return bitcast<Ptr<Int>>(entries).offset(idx * ENTRY_SLOTS + 2).load() }
+}
+
+fun entry_set(entries: Int, idx: Int, key: Int, value: Int): Unit {
+    unsafe {
+        val ep = bitcast<Ptr<Int>>(entries)
+        ep.offset(idx * ENTRY_SLOTS).store(key)
+        ep.offset(idx * ENTRY_SLOTS + 1).store(value)
+        ep.offset(idx * ENTRY_SLOTS + 2).store(1)
+    }
+}
+
+fun imod(a: Int, b: Int): Int {
+    return a - (a / b) * b
+}
+
+// ── String-keyed Map (used by Stage 1) ──────────────────────────────────
+
+fun mapCreate(): Int {
+    unsafe {
+        val map = malloc(MAP_HEADER)
+        val p = bitcast<Ptr<Int>>(map)
+        p.offset(MAP_REFCOUNT).store(1)
+        p.offset(MAP_SIZE).store(0)
+        p.offset(MAP_CAPACITY).store(16)
+        p.offset(MAP_ENTRIES).store(calloc(16 * ENTRY_SLOTS, 8))
+        return map
+    }
+}
+
+fun mapCreate_string(): Int {
+    return mapCreate()
+}
+
+fun smap_grow(map: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val oldCap = p.offset(MAP_CAPACITY).load()
+        val oldEntries = p.offset(MAP_ENTRIES).load()
+        val newCap = oldCap * 2
+        val newEntries = calloc(newCap * ENTRY_SLOTS, 8)
+        p.offset(MAP_CAPACITY).store(newCap)
+        p.offset(MAP_ENTRIES).store(newEntries)
+        p.offset(MAP_SIZE).store(0)
+        var i: Int = 0
+        while (i < oldCap) {
+            if (entry_occupied(oldEntries, i) != 0) {
+                val key = entry_key(oldEntries, i)
+                val value = entry_value(oldEntries, i)
+                var idx: Int = imod(string_hash(key), newCap)
+                while (entry_occupied(newEntries, idx) != 0) {
+                    idx = idx + 1
+                    if (idx >= newCap) { idx = 0 }
+                }
+                entry_set(newEntries, idx, key, value)
+                p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+            }
+            i = i + 1
+        }
+        free(oldEntries)
+    }
+}
+
+fun mapPut(mapVal: Int, key: Int, value: Int): Int {
+    if (mapVal == 0) { return 0 }
+    if (key == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(mapVal)
+        val entries = p.offset(MAP_ENTRIES).load()
+        if (entries == 0) { return 0 }
+        if (p.offset(MAP_SIZE).load() * 2 >= p.offset(MAP_CAPACITY).load()) {
+            smap_grow(mapVal)
+        }
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = imod(string_hash(key), cap)
+        while (entry_occupied(ent, idx) != 0) {
+            if (rockit_string_eq(entry_key(ent, idx), key) == 1) {
+                rockit_retain_value(value)
+                rockit_release_value(entry_value(ent, idx))
+                bitcast<Ptr<Int>>(ent).offset(idx * ENTRY_SLOTS + 1).store(value)
+                return 0
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+        }
+        rockit_string_retain(key)
+        rockit_retain_value(value)
+        entry_set(ent, idx, key, value)
+        p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+    }
+    return 0
+}
+
+fun mapGet(mapVal: Int, key: Int): Int {
+    if (mapVal == 0) { return ROCKIT_NULL }
+    if (key == 0) { return ROCKIT_NULL }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(mapVal)
+        val ent = p.offset(MAP_ENTRIES).load()
+        if (ent == 0) { return ROCKIT_NULL }
+        val cap = p.offset(MAP_CAPACITY).load()
+        var idx: Int = imod(string_hash(key), cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (rockit_string_eq(entry_key(ent, idx), key) == 1) {
+                return entry_value(ent, idx)
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+    return ROCKIT_NULL
+}
+
+fun mapKeys(mapVal: Int): Int {
+    val list = listCreate()
+    if (mapVal == 0) { return list }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(mapVal)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var i: Int = 0
+        while (i < cap) {
+            if (entry_occupied(ent, i) != 0) {
+                listAppend(list, entry_key(ent, i))
+            }
+            i = i + 1
+        }
+    }
+    return list
+}
+
+// ── Integer-keyed Map ──────────────────────────────────────────────────
+
+fun int_hash(key: Int, cap: Int): Int {
+    var h: Int = key
+    if (h < 0) { h = 0 - h }
+    h = h + h * 65599
+    if (h < 0) { h = 0 - h }
+    return imod(h, cap)
+}
+
+fun rockit_map_create(): Int {
+    unsafe {
+        val map = malloc(MAP_HEADER)
+        val p = bitcast<Ptr<Int>>(map)
+        p.offset(MAP_REFCOUNT).store(1)
+        p.offset(MAP_SIZE).store(0)
+        p.offset(MAP_CAPACITY).store(16)
+        p.offset(MAP_ENTRIES).store(calloc(16 * ENTRY_SLOTS, 8))
+        return map
+    }
+}
+
+fun imap_grow(map: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val oldCap = p.offset(MAP_CAPACITY).load()
+        val oldEntries = p.offset(MAP_ENTRIES).load()
+        val newCap = oldCap * 2
+        val newEntries = calloc(newCap * ENTRY_SLOTS, 8)
+        p.offset(MAP_CAPACITY).store(newCap)
+        p.offset(MAP_ENTRIES).store(newEntries)
+        p.offset(MAP_SIZE).store(0)
+        var i: Int = 0
+        while (i < oldCap) {
+            if (entry_occupied(oldEntries, i) != 0) {
+                val key = entry_key(oldEntries, i)
+                val value = entry_value(oldEntries, i)
+                var idx: Int = int_hash(key, newCap)
+                while (entry_occupied(newEntries, idx) != 0) {
+                    idx = idx + 1
+                    if (idx >= newCap) { idx = 0 }
+                }
+                entry_set(newEntries, idx, key, value)
+                p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+            }
+            i = i + 1
+        }
+        free(oldEntries)
+    }
+}
+
+fun rockit_map_put(map: Int, key: Int, value: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        if (p.offset(MAP_SIZE).load() * 2 >= p.offset(MAP_CAPACITY).load()) {
+            imap_grow(map)
+        }
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) {
+                rockit_retain_value(value)
+                rockit_release_value(entry_value(ent, idx))
+                bitcast<Ptr<Int>>(ent).offset(idx * ENTRY_SLOTS + 1).store(value)
+                return
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+        }
+        rockit_retain_value(key)
+        rockit_retain_value(value)
+        entry_set(ent, idx, key, value)
+        p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() + 1)
+    }
+}
+
+fun rockit_map_get(map: Int, key: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) {
+                return entry_value(ent, idx)
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+    unsafe { rockit_panic(cstr("map key not found")) }
+    return 0
+}
+
+fun rockit_map_contains_key(map: Int, key: Int): Int {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) { return 1 }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+    return 0
+}
+
+fun rockit_map_size(map: Int): Int {
+    if (map == 0) { return 0 }
+    unsafe { return bitcast<Ptr<Int>>(map).offset(MAP_SIZE).load() }
+}
+
+fun rockit_map_is_empty(map: Int): Int {
+    if (map == 0) { return 1 }
+    unsafe {
+        if (bitcast<Ptr<Int>>(map).offset(MAP_SIZE).load() == 0) { return 1 }
+    }
+    return 0
+}
+
+fun rockit_map_release(map: Int): Unit {
+    if (map == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val rc = p.offset(MAP_REFCOUNT).load()
+        val newRc = rc - 1
+        if (newRc <= 0) {
+            val cap = p.offset(MAP_CAPACITY).load()
+            val ent = p.offset(MAP_ENTRIES).load()
+            var i: Int = 0
+            while (i < cap) {
+                if (entry_occupied(ent, i) != 0) {
+                    rockit_release_value(entry_key(ent, i))
+                    rockit_release_value(entry_value(ent, i))
+                }
+                i = i + 1
+            }
+            free(ent)
+            free(map)
+        } else {
+            p.offset(MAP_REFCOUNT).store(newRc)
+        }
+    }
+}
+
+fun rockit_map_keys(map: Int): Int {
+    val list = rockit_list_create()
+    if (map == 0) { return list }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var i: Int = 0
+        while (i < cap) {
+            if (entry_occupied(ent, i) != 0) {
+                rockit_list_append(list, entry_key(ent, i))
+            }
+            i = i + 1
+        }
+    }
+    return list
+}
+
+fun rockit_map_values(map: Int): Int {
+    val list = rockit_list_create()
+    if (map == 0) { return list }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var i: Int = 0
+        while (i < cap) {
+            if (entry_occupied(ent, i) != 0) {
+                rockit_list_append(list, entry_value(ent, i))
+            }
+            i = i + 1
+        }
+    }
+    return list
+}
+
+fun rockit_map_remove(map: Int, key: Int): Unit {
+    if (map == 0) { return }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(map)
+        if (p.offset(MAP_SIZE).load() == 0) { return }
+        val cap = p.offset(MAP_CAPACITY).load()
+        val ent = p.offset(MAP_ENTRIES).load()
+        var idx: Int = int_hash(key, cap)
+        val start = idx
+        while (entry_occupied(ent, idx) != 0) {
+            if (entry_key(ent, idx) == key) {
+                rockit_release_value(entry_key(ent, idx))
+                rockit_release_value(entry_value(ent, idx))
+                bitcast<Ptr<Int>>(ent).offset(idx * ENTRY_SLOTS + 2).store(0)
+                p.offset(MAP_SIZE).store(p.offset(MAP_SIZE).load() - 1)
+                return
+            }
+            idx = idx + 1
+            if (idx >= cap) { idx = 0 }
+            if (idx == start) { break }
+        }
+    }
+}
+// io.rok — I/O operations (print, println, readLine)
+// Depends on: memory.rok, string.rok, string_ops.rok
+
+extern fun putchar(ch: Int): Int
+extern fun getchar(): Int
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+fun write_string(s: Int): Unit {
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        write(1, chars, len)
+    }
+}
+
+fun write_newline(): Unit {
+    unsafe { write(1, cstr("\n"), 1) }
+}
+
+fun float_needs_decimal(chars: Int, len: Int): Int {
+    var i: Int = 0
+    while (i < len) {
+        val ch = loadByte(chars, i)
+        if (ch == 46) { return 0 }   // '.'
+        if (ch == 101) { return 0 }  // 'e'
+        if (ch == 69) { return 0 }   // 'E'
+        i = i + 1
+    }
+    return 1
+}
+
+// ── println variants ────────────────────────────────────────────────────
+
+fun rockit_println_int(value: Int): Unit {
+    val s = rockit_int_to_string(value)
+    write_string(s)
+    write_newline()
+    rockit_string_release(s)
+}
+
+fun rockit_println_float(value: Float): Unit {
+    val s = floatToString(value)
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        write(1, chars, len)
+        if (float_needs_decimal(chars, len) == 1) {
+            write(1, cstr(".0"), 2)
+        }
+    }
+    write_newline()
+    rockit_string_release(s)
+}
+
+fun rockit_println_bool(value: Int): Unit {
+    unsafe {
+        if (value != 0) {
+            write(1, cstr("true\n"), 5)
+        } else {
+            write(1, cstr("false\n"), 6)
+        }
+    }
+}
+
+fun rockit_println_string(s: Int): Unit {
+    if (s == 0) {
+        unsafe { write(1, cstr("null\n"), 5) }
+        return
+    }
+    write_string(s)
+    write_newline()
+}
+
+fun rockit_println_null(): Unit {
+    unsafe { write(1, cstr("null\n"), 5) }
+}
+
+fun rockit_println_any(value: Int): Unit {
+    if (value == ROCKIT_NULL) {
+        unsafe { write(1, cstr("null\n"), 5) }
+        return
+    }
+    if (value == 0) {
+        unsafe { write(1, cstr("0\n"), 2) }
+        return
+    }
+    if (is_likely_string_ptr(value) == 1) {
+        write_string(value)
+        write_newline()
+        return
+    }
+    rockit_println_int(value)
+}
+
+fun rockit_println_double(value: Float): Unit {
+    val s = floatToString(value)
+    write_string(s)
+    write_newline()
+    rockit_string_release(s)
+}
+
+// ── print variants (no newline) ─────────────────────────────────────────
+
+fun rockit_print_int(value: Int): Unit {
+    val s = rockit_int_to_string(value)
+    write_string(s)
+    rockit_string_release(s)
+}
+
+fun rockit_print_float(value: Float): Unit {
+    val s = floatToString(value)
+    unsafe {
+        val p = bitcast<Ptr<Int>>(s)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        write(1, chars, len)
+        if (float_needs_decimal(chars, len) == 1) {
+            write(1, cstr(".0"), 2)
+        }
+    }
+    rockit_string_release(s)
+}
+
+fun rockit_print_bool(value: Int): Unit {
+    unsafe {
+        if (value != 0) {
+            write(1, cstr("true"), 4)
+        } else {
+            write(1, cstr("false"), 5)
+        }
+    }
+}
+
+fun rockit_print_string(s: Int): Unit {
+    if (s == 0) {
+        unsafe { write(1, cstr("null"), 4) }
+        return
+    }
+    write_string(s)
+}
+
+fun rockit_print_any(value: Int): Unit {
+    if (value == ROCKIT_NULL) {
+        unsafe { write(1, cstr("null"), 4) }
+        return
+    }
+    if (value == 0) {
+        unsafe { write(1, cstr("0"), 1) }
+        return
+    }
+    if (is_likely_string_ptr(value) == 1) {
+        write_string(value)
+        return
+    }
+    rockit_print_int(value)
+}
+
+fun rockit_print_double(value: Float): Unit {
+    val s = floatToString(value)
+    write_string(s)
+    rockit_string_release(s)
+}
+
+// ── Input ───────────────────────────────────────────────────────────────
+
+fun readLine(): Int {
+    unsafe {
+        val buf = malloc(4096)
+        var pos: Int = 0
+        while (pos < 4095) {
+            val ch = getchar()
+            if (ch < 0) { break }
+            if (ch == 10) { break }
+            storeByte(buf, pos, ch)
+            pos = pos + 1
+        }
+        storeByte(buf, pos, 0)
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+// exception.rok — Exception handling (setjmp/longjmp)
+// Depends on: memory.rok
+
+extern fun longjmp(buf: Int, val2: Int): Unit
+
+val EXC_MAX_DEPTH: Int = 64
+val EXC_JMPBUF_SIZE: Int = 512   // generous per-buffer size (covers all platforms)
+
+var exc_bufs: Int = 0
+var exc_values: Int = 0
+var exc_depth: Int = 0
+
+fun exc_ensure_init(): Unit {
+    if (exc_bufs == 0) {
+        unsafe {
+            exc_bufs = malloc(EXC_MAX_DEPTH * EXC_JMPBUF_SIZE)
+            exc_values = malloc(EXC_MAX_DEPTH * 8)
+        }
+    }
+}
+
+fun exc_check_depth(): Unit {
+    if (exc_depth < EXC_MAX_DEPTH) { return }
+    unsafe { rockit_panic(cstr("try nesting too deep")) }
+}
+
+fun rockit_exc_push(): Int {
+    exc_ensure_init()
+    exc_check_depth()
+    val buf = exc_bufs + exc_depth * EXC_JMPBUF_SIZE
+    exc_depth = exc_depth + 1
+    return buf
+}
+
+fun rockit_exc_pop(): Unit {
+    if (exc_depth > 0) {
+        exc_depth = exc_depth - 1
+    }
+}
+
+fun rockit_exc_throw(value: Int): Unit {
+    if (exc_depth <= 0) {
+        unsafe {
+            write(2, cstr("PANIC: uncaught exception\n"), 25)
+            exit(1)
+        }
+    }
+    exc_depth = exc_depth - 1
+    unsafe {
+        bitcast<Ptr<Int>>(exc_values).offset(exc_depth).store(value)
+    }
+    longjmp(exc_bufs + exc_depth * EXC_JMPBUF_SIZE, 1)
+}
+
+fun rockit_exc_get(): Int {
+    unsafe {
+        return bitcast<Ptr<Int>>(exc_values).offset(exc_depth).load()
+    }
+}
+// file.rok — File I/O operations
+// Depends on: memory.rok, string.rok
+
+extern fun fopen(path: Int, mode: Int): Int
+extern fun fclose(file: Int): Int
+extern fun fread(buf: Int, size: Int, count: Int, file: Int): Int
+extern fun fwrite(buf: Int, size: Int, count: Int, file: Int): Int
+extern fun fseek(file: Int, offset: Int, whence: Int): Int
+extern fun ftell(file: Int): Int
+extern fun remove(path: Int): Int
+
+fun fileExists(path: Int): Int {
+    if (path == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("r"))
+        cstr_done(c, path)
+        if (f != 0) {
+            fclose(f)
+            return 1
+        }
+    }
+    return 0
+}
+
+fun fileRead(path: Int): Int {
+    if (path == 0) {
+        unsafe { return rockit_string_new(cstr("")) }
+    }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("rb"))
+        cstr_done(c, path)
+        if (f == 0) { return rockit_string_new(cstr("")) }
+        fseek(f, 0, 2)    // SEEK_END = 2
+        val size = ftell(f)
+        fseek(f, 0, 0)    // SEEK_SET = 0
+        val buf = malloc(size + 1)
+        val bytesRead = fread(buf, 1, size, f)
+        storeByte(buf, bytesRead, 0)
+        fclose(f)
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+
+fun fileWrite(path: Int, content: Int): Int {
+    if (path == 0) { return 0 }
+    if (content == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("wb"))
+        cstr_done(c, path)
+        if (f == 0) { return 0 }
+        val p = bitcast<Ptr<Int>>(content)
+        val len = p.offset(1).load()
+        val chars = p.offset(2).load()
+        fwrite(chars, 1, len, f)
+        fclose(f)
+        return len
+    }
+}
+
+fun fileWriteBytes(path: Int, bytesListVal: Int): Int {
+    if (path == 0) { return 0 }
+    if (bytesListVal == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val f = fopen(c, cstr("wb"))
+        cstr_done(c, path)
+        if (f == 0) { return 0 }
+        val lp = bitcast<Ptr<Int>>(bytesListVal)
+        val size = lp.offset(LIST_SIZE).load()
+        val arr = lp.offset(LIST_DATA).load()
+        val dp = bitcast<Ptr<Int>>(arr)
+        val buf = malloc(1)
+        var i: Int = 0
+        while (i < size) {
+            val b = dp.offset(i).load()
+            storeByte(buf, 0, b)
+            fwrite(buf, 1, 1, f)
+            i = i + 1
+        }
+        free(buf)
+        fclose(f)
+        return size
+    }
+}
+
+fun fileDelete(path: Int): Int {
+    if (path == 0) { return 0 }
+    unsafe {
+        val c = cstr_from_string(path)
+        val result = remove(c)
+        cstr_done(c, path)
+        if (result == 0) { return 1 }
+    }
+    return 0
+}
+// process.rok — Process, environment, and system operations
+// Depends on: memory.rok, string.rok, list.rok
+
+extern fun getenv(name: Int): Int
+extern fun system(cmd: Int): Int
+extern fun exit(code: Int): Unit
+extern fun uname(buf: Int): Int
+
+var s_argc: Int = 0
+var s_argv: Int = 0
+
+fun rockit_set_args(argc: Int, argv: Int): Unit {
+    s_argc = argc
+    s_argv = argv
+}
+
+fun processArgs(): Int {
+    val list = listCreate()
+    var i: Int = 1
+    while (i < s_argc) {
+        unsafe {
+            val argPtr = bitcast<Ptr<Int>>(s_argv).offset(i).load()
+            val s = rockit_string_new(argPtr)
+            listAppend(list, s)
+        }
+        i = i + 1
+    }
+    return list
+}
+
+fun getEnv(name: Int): Int {
+    unsafe {
+        val c = cstr_from_string(name)
+        val val2 = getenv(c)
+        cstr_done(c, name)
+        if (val2 == 0) {
+            return rockit_string_new(cstr(""))
+        }
+        return rockit_string_new(val2)
+    }
+}
+
+fun executablePath(): Int {
+    if (s_argc > 0) {
+        if (s_argv != 0) {
+            unsafe {
+                val arg0 = bitcast<Ptr<Int>>(s_argv).offset(0).load()
+                if (arg0 != 0) {
+                    return rockit_string_new(arg0)
+                }
+            }
+        }
+    }
+    unsafe { return rockit_string_new(cstr("")) }
+}
+
+fun platformOS(): Int {
+    unsafe {
+        // Use uname() to detect platform at runtime
+        // sysname is the first field: "Darwin" on macOS, "Linux" on Linux
+        val buf = malloc(1024)
+        uname(buf)
+        val first = loadByte(buf, 0)
+        free(buf)
+        if (first == 68) {  // 'D' for Darwin
+            return rockit_string_new(cstr("macos"))
+        }
+        if (first == 76) {  // 'L' for Linux
+            return rockit_string_new(cstr("linux"))
+        }
+        return rockit_string_new(cstr("linux"))
+    }
+}
+
+fun processExit(code: Int): Unit {
+    unsafe {
+        exit(code)
+    }
+}
+
+fun systemExec(cmd: Int): Int {
+    if (cmd == 0) { return 0 - 1 }
+    unsafe {
+        val c = cstr_from_string(cmd)
+        val result = system(c)
+        cstr_done(c, cmd)
+        return result
+    }
+}
+
+fun evalRockit(source: Int): Int {
+    // evalRockit is a VM-specific feature — no-op in native mode
+    return 0
+}
+// network.rok — Networking, time, and random operations
+// Depends on: memory.rok, string.rok, string_ops.rok, object.rok, list.rok, map.rok, io.rok, process.rok
+
+extern fun socket(domain: Int, socktype: Int, protocol: Int): Int
+extern fun connect(sockfd: Int, addr: Int, addrlen: Int): Int
+extern fun send(sockfd: Int, buf: Int, len: Int, flags: Int): Int
+extern fun recv(sockfd: Int, buf: Int, len: Int, flags: Int): Int
+extern fun close(fd: Int): Int
+extern fun getaddrinfo(node: Int, service: Int, hints: Int, res: Int): Int
+extern fun freeaddrinfo(res: Int): Unit
+extern fun gettimeofday(tv: Int, tz: Int): Int
+extern fun usleep(usec: Int): Int
+extern fun srand(seed: Int): Unit
+extern fun rand(): Int
+extern fun time(t: Int): Int
+
+// ── Helpers ────────────────────────────────────────────────────────────
+
+fun net_loadInt32(ptr: Int, byteOffset: Int): Int {
+    unsafe {
+        val b0 = loadByte(ptr, byteOffset)
+        val b1 = loadByte(ptr, byteOffset + 1)
+        val b2 = loadByte(ptr, byteOffset + 2)
+        val b3 = loadByte(ptr, byteOffset + 3)
+        return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+    }
+}
+
+// Check if a C int return value indicates error (-1).
+// On ARM64, -1 as int32 may be zero-extended to 0xFFFFFFFF (4294967295).
+fun net_isError(value: Int): Int {
+    if (value < 0) { return 1 }
+    if (value > 2147483647) { return 1 }
+    return 0
+}
+
+// ── TCP Networking ─────────────────────────────────────────────────────
+
+fun tcpConnect(host: Int, port: Int): Int {
+    unsafe {
+        val hostCstr = cstr_from_string(host)
+        val portStr = toString(port)
+        val portCstr = cstr_from_string(portStr)
+
+        // Allocate and zero hints struct (48 bytes)
+        val hints = malloc(48)
+        memset(hints, 0, 48)
+        // Set ai_socktype = SOCK_STREAM (1) at byte offset 8
+        storeByte(hints, 8, 1)
+
+        // Allocate pointer for result
+        val resPtr = malloc(8)
+        memset(resPtr, 0, 8)
+
+        val ret = getaddrinfo(hostCstr, portCstr, hints, resPtr)
+        cstr_done(portCstr, portStr)
+        cstr_done(hostCstr, host)
+        free(hints)
+
+        if (ret != 0) {
+            free(resPtr)
+            return 0 - 1
+        }
+
+        // Load the result pointer
+        val result = bitcast<Ptr<Int>>(resPtr).offset(0).load()
+        free(resPtr)
+
+        if (result == 0) {
+            return 0 - 1
+        }
+
+        // Read fields from addrinfo struct
+        val family = net_loadInt32(result, 4)
+        val socktype2 = net_loadInt32(result, 8)
+        val protocol = net_loadInt32(result, 12)
+        val addrlen = net_loadInt32(result, 16)
+
+        // ai_addr offset differs by platform:
+        //   macOS:  offset 32 (slot 4) — layout: flags,family,socktype,protocol,addrlen,pad,canonname,addr,next
+        //   Linux:  offset 24 (slot 3) — layout: flags,family,socktype,protocol,addrlen,pad,addr,canonname,next
+        // Detect platform via uname first byte: 'D'=68 (Darwin), 'L'=76 (Linux)
+        val ubuf = malloc(1024)
+        uname(ubuf)
+        val firstByte = loadByte(ubuf, 0)
+        free(ubuf)
+
+        var addrPtr: Int = 0
+        if (firstByte == 68) {
+            // macOS: ai_addr at byte offset 32
+            addrPtr = bitcast<Ptr<Int>>(result).offset(4).load()
+        } else {
+            // Linux: ai_addr at byte offset 24
+            addrPtr = bitcast<Ptr<Int>>(result).offset(3).load()
+        }
+
+        // Create socket
+        val fd = socket(family, socktype2, protocol)
+        if (net_isError(fd) == 1) {
+            freeaddrinfo(result)
+            return 0 - 1
+        }
+
+        // Connect
+        val connResult = connect(fd, addrPtr, addrlen)
+        freeaddrinfo(result)
+
+        if (net_isError(connResult) == 1) {
+            close(fd)
+            return 0 - 1
+        }
+
+        return fd
+    }
+}
+
+fun tcpSend(fd: Int, msg: Int): Int {
+    if (msg == 0) { return 0 }
+    unsafe {
+        val p = bitcast<Ptr<Int>>(msg)
+        val len = p.offset(1).load()       // string length
+        val chars = p.offset(2).load()     // char data pointer
+        val sent = send(fd, chars, len, 0)
+        if (net_isError(sent) == 1) {
+            return 0 - 1
+        }
+        return sent
+    }
+}
+
+fun tcpRecv(fd: Int, maxBytes: Int): Int {
+    unsafe {
+        val buf = malloc(maxBytes + 1)
+        val n = recv(fd, buf, maxBytes, 0)
+        if (net_isError(n) == 1) {
+            free(buf)
+            return rockit_string_new(cstr(""))
+        }
+        if (n == 0) {
+            free(buf)
+            return rockit_string_new(cstr(""))
+        }
+        storeByte(buf, n, 0)  // null-terminate
+        val result = rockit_string_new(buf)
+        free(buf)
+        return result
+    }
+}
+
+fun tcpClose(fd: Int): Unit {
+    unsafe {
+        close(fd)
+    }
+}
+
+// ── Time ────────────────────────────────────────────────────────────────
+
+fun currentTimeMillis(): Int {
+    unsafe {
+        val tv = malloc(16)  // struct timeval: tv_sec(8) + tv_usec(4) + pad(4)
+        gettimeofday(tv, 0)
+        val sec = bitcast<Ptr<Int>>(tv).offset(0).load()
+        val usec = net_loadInt32(tv, 8)
+        free(tv)
+        return sec * 1000 + usec / 1000
+    }
+}
+
+fun sleepMillis(ms: Int): Unit {
+    unsafe {
+        usleep(ms * 1000)
+    }
+}
+
+// ── Random ──────────────────────────────────────────────────────────────
+
+var s_rand_seeded: Int = 0
+
+fun randomInt(bound: Int): Int {
+    unsafe {
+        if (s_rand_seeded == 0) {
+            srand(time(0))
+            s_rand_seeded = 1
+        }
+        if (bound <= 0) { return 0 }
+        val r = rand()
+        // Ensure non-negative (rand() may return values needing masking on some platforms)
+        var v: Int = r
+        if (v < 0) { v = 0 - v }
+        if (v > 2147483647) { v = v - 2147483648 }
+        return imod(v, bound)
+    }
+}
+
+// ── Date Components ─────────────────────────────────────────────────────
+
+fun epochToComponents(epochSec: Int): Int {
+    // Convert epoch seconds to year/month/day/hour/minute/second
+    // Returns a Map with keys: year, month, day, hour, minute, second, dayOfWeek
+
+    val totalDays = epochSec / 86400
+    val daySeconds = epochSec - totalDays * 86400
+    val hour = daySeconds / 3600
+    val minute = (daySeconds - hour * 3600) / 60
+    val second = daySeconds - hour * 3600 - minute * 60
+
+    // Civil date from day count (Howard Hinnant's algorithm)
+    // Shift epoch to 0000-03-01 for easier month calculation
+    val z = totalDays + 719468
+    val era = z / 146097
+    val doe = z - era * 146097
+    val yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    val y = yoe + era * 400
+    val doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    val mp = (5 * doy + 2) / 153
+    val day = doy - (153 * mp + 2) / 5 + 1
+
+    var month: Int = 0
+    if (mp < 10) {
+        month = mp + 3
+    } else {
+        month = mp - 9
+    }
+
+    var year: Int = y
+    if (month <= 2) {
+        year = year + 1
+    }
+
+    // Day of week: 0=Sunday..6=Saturday (Jan 1, 1970 was Thursday = 4)
+    val dow = imod(totalDays + 4, 7)
+
+    val m = mapCreate()
+    unsafe {
+        mapPut(m, rockit_string_new(cstr("year")), year)
+        mapPut(m, rockit_string_new(cstr("month")), month)
+        mapPut(m, rockit_string_new(cstr("day")), day)
+        mapPut(m, rockit_string_new(cstr("hour")), hour)
+        mapPut(m, rockit_string_new(cstr("minute")), minute)
+        mapPut(m, rockit_string_new(cstr("second")), second)
+        mapPut(m, rockit_string_new(cstr("dayOfWeek")), dow)
+    }
+    return m
+}
+// concurrency.rok — Cooperative task scheduler, actors
+// Depends on: memory.rok, object.rok
+//
+// Frame header layout (first 4 i64 slots of every continuation frame):
+//   slot 0: state          (i64)
+//   slot 1: parent_resume  (function pointer)
+//   slot 2: parent_frame   (pointer)
+//   slot 3: join_counter   (i64)
+//
+// Task queue entry layout (3 i64 slots):
+//   slot 0: resume_fn  (function pointer)
+//   slot 1: frame      (pointer)
+//   slot 2: result     (i64)
+
+val TASK_QUEUE_CAP: Int = 4096
+val TASK_SLOTS: Int = 3
+val COROUTINE_SUSPENDED: Int = 0 - 9999
+
+var sched_tasks: Int = 0
+var sched_head: Int = 0
+var sched_tail: Int = 0
+var sched_count: Int = 0
+
+fun sched_ensure_init(): Unit {
+    if (sched_tasks == 0) {
+        unsafe {
+            sched_tasks = calloc(TASK_QUEUE_CAP * TASK_SLOTS, 8)
+        }
+    }
+}
+
+fun rockit_task_schedule(resume_fn: Int, frame: Int, result: Int): Unit {
+    sched_ensure_init()
+    unsafe {
+        if (sched_count >= TASK_QUEUE_CAP) {
+            write(2, cstr("rockit: task queue overflow\n"), 27)
+            exit(1)
+        }
+        val tp = bitcast<Ptr<Int>>(sched_tasks)
+        tp.offset(sched_tail * TASK_SLOTS).store(resume_fn)
+        tp.offset(sched_tail * TASK_SLOTS + 1).store(frame)
+        tp.offset(sched_tail * TASK_SLOTS + 2).store(result)
+        sched_tail = sched_tail + 1
+        if (sched_tail >= TASK_QUEUE_CAP) { sched_tail = 0 }
+        sched_count = sched_count + 1
+    }
+}
+
+fun rockit_frame_alloc(size_bytes: Int): Int {
+    return calloc(1, size_bytes)
+}
+
+fun rockit_frame_free(frame: Int): Unit {
+    free(frame)
+}
+
+fun rockit_await(child_resume_fn: Int, child_frame: Int,
+                 parent_resume_fn: Int, parent_frame: Int): Int {
+    unsafe {
+        // Set up parent continuation in child's frame header
+        val hdr = bitcast<Ptr<Int>>(child_frame)
+        hdr.offset(1).store(parent_resume_fn)
+        hdr.offset(2).store(parent_frame)
+    }
+    rockit_task_schedule(child_resume_fn, child_frame, 0)
+    return COROUTINE_SUSPENDED
+}
+
+fun rockit_run_event_loop(): Unit {
+    while (sched_count > 0) {
+        unsafe {
+            val tp = bitcast<Ptr<Int>>(sched_tasks)
+            val resume_fn = tp.offset(sched_head * TASK_SLOTS).load()
+            val frame = tp.offset(sched_head * TASK_SLOTS + 1).load()
+            val result = tp.offset(sched_head * TASK_SLOTS + 2).load()
+            sched_head = sched_head + 1
+            if (sched_head >= TASK_QUEUE_CAP) { sched_head = 0 }
+            sched_count = sched_count - 1
+
+            // Indirect call: resume_fn(frame, result)
+            val ret = callResumeFn(resume_fn, frame, result)
+
+            if (ret != COROUTINE_SUSPENDED) {
+                // Task completed — resume parent if one exists
+                val hdr = bitcast<Ptr<Int>>(frame)
+                val parent_resume = hdr.offset(1).load()
+                if (parent_resume != 0) {
+                    val parent_frame = hdr.offset(2).load()
+                    // Decrement parent's join counter
+                    val phdr = bitcast<Ptr<Int>>(parent_frame)
+                    val jc = phdr.offset(3).load()
+                    if (jc > 0) {
+                        phdr.offset(3).store(jc - 1)
+                    }
+                    rockit_task_schedule(parent_resume, parent_frame, ret)
+                }
+                rockit_frame_free(frame)
+            }
+        }
+    }
+}
+
+fun rockit_is_suspended(value: Int): Int {
+    if (value == COROUTINE_SUSPENDED) { return 1 }
+    return 0
+}
+
+// ── Type hierarchy (for is-type checking with inheritance) ──────────────
+
+var g_type_table: Int = 0
+var g_type_count: Int = 0
+
+fun rockit_set_type_hierarchy(table: Int, count: Int): Unit {
+    g_type_table = table
+    g_type_count = count
+}
+
+fun find_parent_type(childName: Int): Int {
+    // Each entry is 2 pointers (16 bytes): [child_ptr, parent_ptr]
+    var i: Int = 0
+    while (i < g_type_count) {
+        unsafe {
+            val ep = bitcast<Ptr<Int>>(g_type_table)
+            val child = ep.offset(i * 2).load()
+            // Compare C strings (null-terminated)
+            var j: Int = 0
+            var match: Int = 1
+            while (true) {
+                val a = loadByte(child, j)
+                val b = loadByte(childName, j)
+                if (a != b) {
+                    match = 0
+                    break
+                }
+                if (a == 0) { break }
+                j = j + 1
+            }
+            if (match == 1) {
+                return ep.offset(i * 2 + 1).load()
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fun rockit_is_type(obj: Int, targetType: Int): Int {
+    if (obj == 0) { return 0 }
+    unsafe {
+        var current: Int = bitcast<Ptr<Int>>(obj).offset(0).load()  // typeName
+        while (current != 0) {
+            // Compare C strings
+            var i: Int = 0
+            var match: Int = 1
+            while (true) {
+                val a = loadByte(current, i)
+                val b = loadByte(targetType, i)
+                if (a != b) {
+                    match = 0
+                    break
+                }
+                if (a == 0) { break }
+                i = i + 1
+            }
+            if (match == 1) { return 1 }
+            current = find_parent_type(current)
+        }
+    }
+    return 0
+}
+
+// ── Actor Runtime ──────────────────────────────────────────────────────
+// Actor layout: [object_ptr:i64]
+
+fun rockit_actor_create(typeName: Int, fieldCount: Int): Int {
+    unsafe {
+        val act = malloc(8)
+        val obj = rockit_object_alloc(typeName, fieldCount)
+        bitcast<Ptr<Int>>(act).offset(0).store(obj)
+        return act
+    }
+}
+
+fun rockit_actor_get_object(act: Int): Int {
+    if (act == 0) {
+        unsafe { rockit_panic(cstr("null actor dereference")) }
+    }
+    unsafe {
+        return bitcast<Ptr<Int>>(act).offset(0).load()
+    }
+}
+
+fun rockit_actor_release(act: Int): Unit {
+    if (act == 0) { return }
+    unsafe {
+        val obj = bitcast<Ptr<Int>>(act).offset(0).load()
+        rockit_release(obj)
+        free(act)
+    }
+}
