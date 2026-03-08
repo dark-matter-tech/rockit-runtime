@@ -38,11 +38,11 @@ jobs:
       - name: Clone and build Stage 0 compiler (Swift)
         run: |
           git clone --depth 1 "https://x-access-token:${GITEA_PAT}@${GITHUB_SERVER_URL#https://}/Dark-Matter/rockit-booster.git" /tmp/stage0
-        env:
-          GITEA_PAT: ${{ secrets.GITEAPAT }}
           cd /tmp/stage0 && swift build -c release
           STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
           echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
+        env:
+          GITEA_PAT: ${{ secrets.GITEAPAT }}
 
       - name: Clone rockit-compiler (Stage 1 source)
         run: |
