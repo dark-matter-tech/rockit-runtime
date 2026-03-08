@@ -91,9 +91,9 @@ jobs:
           GITHUB_TOKEN: ${{ gitea.token }}
       - name: Push to GitHub
         run: |
-          git remote add github "https://x-access-token:${GH_PAT}@github.com/dark-matter-tech/rockit-runtime.git"
+          git remote add github "https://x-access-token:${GH_MIRROR_PAT}@github.com/dark-matter-tech/rockit-runtime.git"
           git push github --all --force
           git push github --tags --force
           echo "Mirrored to GitHub"
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_MIRROR_PAT: ${{ secrets.GH_MIRROR_PAT }}
