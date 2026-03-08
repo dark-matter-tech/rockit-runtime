@@ -39,12 +39,13 @@ jobs:
       - name: Build Stage 1 compiler
         run: |
           cd /tmp/rockit-compiler && bash src/build.sh
-          "$STAGE0" build-native /tmp/rockit-compiler/src/command.rok -o /tmp/stage1
-          echo "ROCKIT=/tmp/stage1" >> "$GITHUB_ENV"
+          "$STAGE0" build-native /tmp/rockit-compiler/src/command.rok
+          chmod +x /tmp/rockit-compiler/src/command
+          echo "ROCKIT=/tmp/rockit-compiler/src/command" >> "$GITHUB_ENV"
 
       - name: Build Rockit freestanding runtime
         run: |
-          ROCKIT=/tmp/stage1 bash rockit/build.sh
+          ROCKIT=/tmp/rockit-compiler/src/command bash rockit/build.sh
 
       - name: Verify output
         run: |
