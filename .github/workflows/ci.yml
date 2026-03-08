@@ -25,26 +25,21 @@ jobs:
       - name: Checkout rockit-runtime
         uses: actions/checkout@v4
 
-      - name: Clone bootstrap compiler (moon)
+      - name: Clone and build Stage 0 compiler (Swift)
         run: |
-          git clone --depth 1 https://github.com/micahburnside/moon.git /tmp/moon
-
-      - name: Build Stage 0 compiler (Swift)
-        working-directory: /tmp/moon/RockitCompiler
-        run: |
-          swift build -c release --product rockit
-          STAGE0="$(swift build -c release --show-bin-path)/rockit"
+          git clone --depth 1 https://github.com/dark-matter-tech/rockit-booster.git /tmp/stage0
+          cd /tmp/stage0 && swift build -c release
+          STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
           echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
 
       - name: Clone rockit-compiler (Stage 1 source)
         run: |
-          git clone --depth 1 https://github.com/micahburnside/moon.git /tmp/rockit-compiler
+          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit-compiler.git /tmp/rockit-compiler
 
       - name: Build Stage 1 compiler
-        working-directory: /tmp/rockit-compiler/RockitCompiler
         run: |
-          bash self-hosted-rockit/build.sh
-          "$STAGE0" build-native self-hosted-rockit/command.rok -o /tmp/stage1
+          cd /tmp/rockit-compiler && bash src/build.sh
+          "$STAGE0" build-native /tmp/rockit-compiler/src/command.rok -o /tmp/stage1
           echo "ROCKIT=/tmp/stage1" >> "$GITHUB_ENV"
 
       - name: Build Rockit freestanding runtime
