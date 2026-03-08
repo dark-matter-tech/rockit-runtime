@@ -37,14 +37,18 @@ jobs:
 
       - name: Clone and build Stage 0 compiler (Swift)
         run: |
-          git clone --depth 1 "${GITHUB_SERVER_URL}/Dark-Matter/rockit-booster.git" /tmp/stage0
+          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/Dark-Matter/rockit-booster.git" /tmp/stage0
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
           cd /tmp/stage0 && swift build -c release
           STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
           echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
 
       - name: Clone rockit-compiler (Stage 1 source)
         run: |
-          git clone --depth 1 --recurse-submodules "${GITHUB_SERVER_URL}/Dark-Matter/rockit-compiler.git" /tmp/rockit-compiler
+          git clone --depth 1 --recurse-submodules "https://x-access-token:${GITHUB_TOKEN}@${GITHUB_SERVER_URL#https://}/Dark-Matter/rockit-compiler.git" /tmp/rockit-compiler
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
 
       - name: Build Stage 1 compiler
         run: |
