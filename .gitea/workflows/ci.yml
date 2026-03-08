@@ -37,14 +37,14 @@ jobs:
 
       - name: Clone and build Stage 0 compiler (Swift)
         run: |
-          git clone --depth 1 https://github.com/dark-matter-tech/rockit-booster.git /tmp/stage0
+          git clone --depth 1 https://rustygits.com/Dark-Matter/rockit-booster.git /tmp/stage0
           cd /tmp/stage0 && swift build -c release
           STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
           echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
 
       - name: Clone rockit-compiler (Stage 1 source)
         run: |
-          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit-compiler.git /tmp/rockit-compiler
+          git clone --depth 1 --recurse-submodules https://rustygits.com/Dark-Matter/rockit-compiler.git /tmp/rockit-compiler
 
       - name: Build Stage 1 compiler
         run: |
