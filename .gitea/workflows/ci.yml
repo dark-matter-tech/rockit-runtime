@@ -66,3 +66,29 @@ jobs:
           clang -c -O2 -w -o c/rockit_runtime.o c/rockit_runtime.c
           test -f c/rockit_runtime.o
           echo "C runtime compiled successfully"
+
+  mirror:
+    name: Mirror to GitHub
+    runs-on: ubuntu-22.04
+    needs: [build-linux]
+    if: github.event_name == 'push'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --bare "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
+      - name: Push to GitHub
+        run: |
+          git remote add github "https://x-access-token:${GH_PAT}@github.com/dark-matter-tech/rockit-runtime.git"
+          git push github --all --force
+          git push github --tags --force
+          echo "Mirrored to GitHub"
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
