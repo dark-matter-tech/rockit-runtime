@@ -14,7 +14,7 @@ jobs:
   build-linux:
     name: Build Runtime (Linux)
     runs-on: ubuntu-22.04
-    container: swift:5.10.1-jammy
+    container: ubuntu:22.04
     defaults:
       run:
         shell: bash
@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update -qq
-          apt-get install -y -qq clang lld llvm-dev libssl-dev curl git
+          apt-get install -y -qq clang lld llvm-dev libssl-dev pkg-config git curl ca-certificates
 
       - name: Checkout
         run: |
@@ -35,31 +35,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ gitea.token }}
 
-      - name: Clone and build Stage 0 compiler (Swift)
+      - name: Download Rockit toolchain
         run: |
-          git clone --depth 1 "https://x-access-token:${GITEA_PAT}@${GITHUB_SERVER_URL#https://}/Dark-Matter/rockit-booster.git" /tmp/stage0
-          cd /tmp/stage0 && swift build -c release
-          STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
-          echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
+          API="${GITHUB_SERVER_URL}/api/v1"
+          curl -sL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${API}/packages/Dark-Matter/generic/rockit-toolchain/latest/rockit-toolchain-linux-x86_64.tar.gz" \
+            -o /tmp/toolchain.tar.gz
+          cd /tmp && tar -xzf toolchain.tar.gz
+          chmod +x /tmp/rockit-toolchain/bin/rockit
+          /tmp/rockit-toolchain/bin/rockit version
+          echo "ROCKIT=/tmp/rockit-toolchain/bin/rockit" >> "$GITHUB_ENV"
         env:
-          GITEA_PAT: ${{ secrets.GITEAPAT }}
-
-      - name: Clone rockit-compiler (Stage 1 source)
-        run: |
-          git clone --depth 1 --recurse-submodules "https://x-access-token:${GITEA_PAT}@${GITHUB_SERVER_URL#https://}/Dark-Matter/rockit-compiler.git" /tmp/rockit-compiler
-        env:
-          GITEA_PAT: ${{ secrets.GITEAPAT }}
-
-      - name: Build Stage 1 compiler
-        run: |
-          cd /tmp/rockit-compiler && bash src/build.sh
-          "$STAGE0" build-native /tmp/rockit-compiler/src/command.rok
-          chmod +x /tmp/rockit-compiler/src/command
-          echo "ROCKIT=/tmp/rockit-compiler/src/command" >> "$GITHUB_ENV"
+          GITHUB_TOKEN: ${{ gitea.token }}
 
       - name: Build Rockit freestanding runtime
         run: |
-          ROCKIT=/tmp/rockit-compiler/src/command bash rockit/build.sh
+          ROCKIT=$ROCKIT bash rockit/build.sh
 
       - name: Verify output
         run: |
