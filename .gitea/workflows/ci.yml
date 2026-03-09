@@ -23,7 +23,8 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update -qq
-          apt-get install -y -qq clang lld llvm-dev libssl-dev pkg-config git curl ca-certificates
+          apt-get install -y -qq clang-15 lld llvm-dev libssl-dev pkg-config git curl ca-certificates
+          ln -sf /usr/bin/clang-15 /usr/bin/clang
 
       - name: Checkout
         run: |
