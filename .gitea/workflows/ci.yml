@@ -13,18 +13,15 @@ jobs:
   build-linux:
     name: Build Runtime (Linux)
     runs-on: ubuntu-22.04
-    container: ubuntu:22.04
+    container: wrightwingman/rockit-toolchain:latest
     defaults:
       run:
         shell: bash
+    env:
+      ROCKIT: /usr/local/bin/rockit
+      RUNTIME: /usr/local/share/rockit/rockit_runtime.o
 
     steps:
-      - name: Install dependencies
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq clang-15 lld llvm-dev libssl-dev pkg-config git curl ca-certificates
-          ln -sf /usr/bin/clang-15 /usr/bin/clang
-
       - name: Checkout
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -35,22 +32,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ gitea.token }}
 
-      - name: Download Rockit toolchain
-        run: |
-          API="${GITHUB_SERVER_URL}/api"
-          curl -sL -H "Authorization: token ${GITEA_PAT}" \
-            "${API}/packages/Dark-Matter/generic/rockit-toolchain/latest/rockit-toolchain-linux-x86_64.tar.gz" \
-            -o /tmp/toolchain.tar.gz
-          cd /tmp && tar -xzf toolchain.tar.gz
-          chmod +x /tmp/rockit-toolchain/bin/rockit
-          /tmp/rockit-toolchain/bin/rockit version
-          echo "ROCKIT=/tmp/rockit-toolchain/bin/rockit" >> "$GITHUB_ENV"
-        env:
-          GITEA_PAT: ${{ secrets.GITEAPAT }}
-
       - name: Build Rockit freestanding runtime
         run: |
-          ROCKIT=$ROCKIT bash rockit/build.sh
+          bash rockit/build.sh
 
       - name: Verify output
         run: |
