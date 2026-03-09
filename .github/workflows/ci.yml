@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [develop, master]
   pull_request:
-    branches: [master]
+    branches: [develop, beta, master, staging]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,38 +13,18 @@ jobs:
   build-linux:
     name: Build Runtime (Linux)
     runs-on: ubuntu-22.04
-    container: swift:5.10.1-jammy
+    container: wrightwingman/rockit-toolchain:latest
+    env:
+      ROCKIT: /usr/local/bin/rockit
+      RUNTIME: /usr/local/share/rockit/rockit_runtime.o
 
     steps:
-      - name: Install dependencies
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq clang lld llvm-dev libssl-dev curl git
-
       - name: Checkout rockit-runtime
         uses: actions/checkout@v4
 
-      - name: Clone and build Stage 0 compiler (Swift)
-        run: |
-          git clone --depth 1 https://github.com/dark-matter-tech/rockit-booster.git /tmp/stage0
-          cd /tmp/stage0 && swift build -c release
-          STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
-          echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
-
-      - name: Clone rockit-compiler (Stage 1 source)
-        run: |
-          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit-compiler.git /tmp/rockit-compiler
-
-      - name: Build Stage 1 compiler
-        run: |
-          cd /tmp/rockit-compiler && bash src/build.sh
-          "$STAGE0" build-native /tmp/rockit-compiler/src/command.rok
-          chmod +x /tmp/rockit-compiler/src/command
-          echo "ROCKIT=/tmp/rockit-compiler/src/command" >> "$GITHUB_ENV"
-
       - name: Build Rockit freestanding runtime
         run: |
-          ROCKIT=/tmp/rockit-compiler/src/command bash rockit/build.sh
+          bash rockit/build.sh
 
       - name: Verify output
         run: |
