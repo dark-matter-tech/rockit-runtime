@@ -1574,13 +1574,14 @@ int64_t tcpSend(int64_t fd, const char *msg_str) {
     return (int64_t)sent;
 }
 
+static RockitString* rockit_string_from_bytes(const unsigned char *data, int64_t len);
+
 RockitString *tcpRecv(int64_t fd, int64_t maxBytes) {
     char *buf = malloc(maxBytes + 1);
     if (!buf) return rockit_string_new("");
     ssize_t n = recv((int)fd, buf, (size_t)maxBytes, 0);
     if (n <= 0) { free(buf); return rockit_string_new(""); }
-    buf[n] = '\0';
-    RockitString *result = rockit_string_new(buf);
+    RockitString *result = rockit_string_from_bytes((unsigned char *)buf, n);
     free(buf);
     return result;
 }
