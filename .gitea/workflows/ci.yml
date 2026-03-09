@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [develop, beta, master, staging]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Build Runtime (Linux)
+    runs-on: ubuntu-22.04
+    container: wrightwingman/rockit-toolchain:latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      ROCKIT: /usr/local/bin/rockit
+      RUNTIME: /usr/local/share/rockit/rockit_runtime.o
+
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          git clone --depth 1 --branch "${BRANCH}" "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
+
+      - name: Build Rockit freestanding runtime
+        run: |
+          bash rockit/build.sh
+
+      - name: Verify output
+        run: |
+          test -f rockit/rockit_runtime.o
+          echo "rockit_runtime.o built successfully"
+
+      - name: Compile C runtime
+        run: |
+          clang -c -O2 -w -o c/rockit_runtime.o c/rockit_runtime.c
+          test -f c/rockit_runtime.o
+          echo "C runtime compiled successfully"
+
+  mirror:
+    name: Mirror to GitHub
+    runs-on: ubuntu-22.04
+    needs: [build-linux]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/staging')
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --bare "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
+      - name: Push to GitHub
+        run: |
+          git remote add github "https://x-access-token:${GH_MIRROR_PAT}@github.com/dark-matter-tech/rockit-runtime.git"
+          git push github --all --force
+          git push github --tags --force
+          echo "Mirrored to GitHub"
+        env:
+          GH_MIRROR_PAT: ${{ secrets.GH_MIRROR_PAT }}
