@@ -2,9 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [develop, master]
   pull_request:
-    branches: [master]
+    branches: [develop, master, staging]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,7 +13,7 @@ jobs:
   build-linux:
     name: Build Runtime (Linux)
     runs-on: ubuntu-22.04
-    container: swift:5.10.1-jammy
+    container: ubuntu:22.04
     defaults:
       run:
         shell: bash
@@ -23,7 +22,8 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update -qq
-          apt-get install -y -qq clang lld llvm-dev libssl-dev curl git
+          apt-get install -y -qq clang-15 lld llvm-dev libssl-dev pkg-config git curl ca-certificates
+          ln -sf /usr/bin/clang-15 /usr/bin/clang
 
       - name: Checkout
         run: |
@@ -35,26 +35,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ gitea.token }}
 
-      - name: Clone and build Stage 0 compiler (Swift)
+      - name: Download Rockit toolchain
         run: |
-          git clone --depth 1 https://github.com/dark-matter-tech/rockit-booster.git /tmp/stage0
-          cd /tmp/stage0 && swift build -c release
-          STAGE0="$(cd /tmp/stage0 && swift build -c release --show-bin-path)/rockit"
-          echo "STAGE0=$STAGE0" >> "$GITHUB_ENV"
-
-      - name: Clone rockit-compiler (Stage 1 source)
-        run: |
-          git clone --depth 1 --recurse-submodules https://github.com/dark-matter-tech/rockit-compiler.git /tmp/rockit-compiler
-
-      - name: Build Stage 1 compiler
-        run: |
-          cd /tmp/rockit-compiler && bash src/build.sh
-          "$STAGE0" build-native /tmp/rockit-compiler/src/command.rok -o /tmp/stage1
-          echo "ROCKIT=/tmp/stage1" >> "$GITHUB_ENV"
+          API="${GITHUB_SERVER_URL}/api"
+          curl -sL -H "Authorization: token ${GITEA_PAT}" \
+            "${API}/packages/Dark-Matter/generic/rockit-toolchain/latest/rockit-toolchain-linux-x86_64.tar.gz" \
+            -o /tmp/toolchain.tar.gz
+          cd /tmp && tar -xzf toolchain.tar.gz
+          chmod +x /tmp/rockit-toolchain/bin/rockit
+          /tmp/rockit-toolchain/bin/rockit version
+          echo "ROCKIT=/tmp/rockit-toolchain/bin/rockit" >> "$GITHUB_ENV"
+        env:
+          GITEA_PAT: ${{ secrets.GITEAPAT }}
 
       - name: Build Rockit freestanding runtime
         run: |
-          ROCKIT=/tmp/stage1 bash rockit/build.sh
+          ROCKIT=$ROCKIT bash rockit/build.sh
 
       - name: Verify output
         run: |
@@ -66,3 +62,29 @@ jobs:
           clang -c -O2 -w -o c/rockit_runtime.o c/rockit_runtime.c
           test -f c/rockit_runtime.o
           echo "C runtime compiled successfully"
+
+  mirror:
+    name: Mirror to GitHub
+    runs-on: ubuntu-22.04
+    needs: [build-linux]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/staging')
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "machine ${GITHUB_SERVER_URL#https://} login x-access-token password ${GITHUB_TOKEN}" > ~/.netrc
+          chmod 600 ~/.netrc
+          git clone --bare "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" .
+        env:
+          GITHUB_TOKEN: ${{ gitea.token }}
+      - name: Push to GitHub
+        run: |
+          git remote add github "https://x-access-token:${GH_MIRROR_PAT}@github.com/dark-matter-tech/rockit-runtime.git"
+          git push github --all --force
+          git push github --tags --force
+          echo "Mirrored to GitHub"
+        env:
+          GH_MIRROR_PAT: ${{ secrets.GH_MIRROR_PAT }}
