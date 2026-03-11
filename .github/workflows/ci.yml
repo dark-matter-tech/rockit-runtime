@@ -13,13 +13,13 @@ jobs:
   build-linux:
     name: Build Runtime (Linux)
     runs-on: ubuntu-22.04
-    container: wrightwingman/rockit-toolchain:latest
-    env:
-      ROCKIT: /usr/local/bin/rockit
-      RUNTIME: /usr/local/share/rockit/rockit_runtime.o
+    container: wrightwingman/rockit-compiler:rc
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout rockit-runtime
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build Rockit freestanding runtime
